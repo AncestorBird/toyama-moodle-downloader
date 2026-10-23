@@ -1,0 +1,19 @@
+# Downloaded teaching materials and local state
+/moodle_downloads/
+
+# Credentials and local configuration
+.env
+.env.*
+*.pem
+*.key
+*credentials*.json
+*token*.json
+
+# Python / macOS / editors
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+.vscode/
+.idea/
