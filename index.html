@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="富山大学Moodleの授業資料を、選んでまとめてダウンロード。">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://moodle52.u-toyama.ac.jp; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta name="referrer" content="no-referrer">
+    <title>Moodle資料取得 | 富山大学</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./src/styles.css">
+    <script type="module" src="./src/main.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="Moodle資料取得 ホーム">
+        <span class="brand-icon" aria-hidden="true">m<span>↓</span></span>
+        <span>Moodle <strong>資料取得</strong></span>
+      </a>
+      <a class="source-link" href="https://github.com/AncestorBird/toyama-moodle-downloader" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main>
+      <section class="intro">
+        <p class="eyebrow"><span></span> 富山大学 · 専門科目 / その他</p>
+        <h1>授業の資料を、<br class="mobile-break">ひとまとめに。</h1>
+        <p class="intro-description">必要な授業を選んで、資料をまとめてダウンロード。<br>保存したファイルは、授業ごとのフォルダに整理されます。</p>
+      </section>
+
+      <div class="workspace">
+        <aside class="account-column">
+          <section class="card account-card" aria-labelledby="account-heading">
+            <div class="section-heading"><span class="step">01</span><h2 id="account-heading">Moodleにログイン</h2></div>
+            <form id="login-form" method="post" autocomplete="on">
+              <label class="field-label" for="username">ユーザー名</label>
+              <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required placeholder="Moodleのユーザー名">
+              <label class="field-label" for="password">パスワード</label>
+              <div class="password-field">
+                <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="パスワードを入力">
+                <button id="show-password" type="button" class="show-password" aria-label="パスワードを表示" aria-pressed="false">表示</button>
+              </div>
+              <label class="checkbox-label remember-option" id="remember-option" hidden><input id="remember" type="checkbox">このブラウザにパスワードを保存</label>
+              <button id="login-button" type="submit" class="button primary full-width" disabled>ログイン <span aria-hidden="true">→</span></button>
+            </form>
+            <div id="session-box" hidden>
+              <div class="account-profile"><span class="avatar" aria-hidden="true">✓</span><div><strong id="account-name"></strong><span class="connected-label">Moodleに接続中</span></div></div>
+              <button id="logout-button" type="button" class="button secondary full-width">ログアウト</button>
+            </div>
+            <p class="password-note" id="password-note">保存・自動入力には、ブラウザのパスワードマネージャーを利用できます。</p>
+            <div class="privacy-note"><span aria-hidden="true">↗</span><p>入力情報は大学のMoodleに直接送信します。<br><span>moodle52.u-toyama.ac.jp</span></p></div>
+          </section>
+          <section class="guide-card" aria-labelledby="guide-heading">
+            <h2 id="guide-heading">使い方</h2>
+            <ol><li>自分のMoodleアカウントでログイン</li><li>資料が必要な授業にチェック</li><li>ZIPファイルをダウンロード</li></ol>
+            <p>保存先はブラウザのダウンロード設定に従います。</p>
+          </section>
+        </aside>
+
+        <section class="card courses-card" aria-labelledby="courses-heading">
+          <div class="courses-top"><div class="section-heading"><span class="step">02</span><h2 id="courses-heading">授業を選ぶ</h2></div><span id="course-count" class="count-badge">未接続</span></div>
+          <div class="course-toolbar">
+            <label class="search-field"><span aria-hidden="true">⌕</span><input id="course-search" type="search" placeholder="授業名・IDで検索" aria-label="授業名・IDで検索" disabled></label>
+            <button id="select-all" type="button" class="text-button" disabled>表示中をすべて選択</button>
+          </div>
+          <div id="course-list" class="course-list">
+            <div class="empty-state"><span class="empty-icon" aria-hidden="true">▤</span><h3>ここに授業が表示されます</h3><p>Moodleにログインすると、<br>登録している授業を選べます。</p></div>
+          </div>
+          <div class="download-panel">
+            <div class="selection-summary"><span class="selection-number" id="selected-count">0</span><p>件の授業を選択中<span>授業内の取得可能な資料をZIPにまとめます</span></p></div>
+            <label class="checkbox-label preview-option"><input id="preview" type="checkbox" disabled>まず取得予定の資料だけ確認する</label>
+            <button id="download-button" type="button" class="button primary full-width" disabled><span aria-hidden="true">↓</span> 選択した授業の資料を取得</button>
+            <p class="download-hint">1ファイル50 MB・合計200 MBまで。授業は複数選べます。</p>
+          </div>
+        </section>
+      </div>
+
+      <section class="card activity-card" aria-labelledby="activity-heading">
+        <div class="activity-top"><h2 id="activity-heading">取得状況</h2><button id="cancel-button" type="button" class="text-button" hidden>中止する</button></div>
+        <p id="status" class="status" role="status" aria-live="polite">ログインして、取得する授業を選んでください。</p>
+        <progress id="progress" value="0" max="1" aria-label="資料の取得状況" hidden></progress>
+        <div id="activity-log" class="activity-log" aria-label="資料の取得結果"></div>
+        <a id="archive-link" class="button secondary archive-link" hidden>ZIPをもう一度保存</a>
+      </section>
+
+      <footer>
+        <p>富山大学の公式ツールではありません。</p>
+        <details><summary>情報の扱い・対応範囲</summary><div class="privacy-details">
+          <p>GitHub Pagesで動く静的なWebアプリです。認証情報・トークン・資料をアプリのサーバーへ送信せず、Moodleに直接接続します。外部のアクセス解析は使用しません。</p>
+          <p>アプリはパスワード・トークンをlocalStorageやCookieに保存しません。ブラウザのパスワード保存・同期は、ご自身のブラウザ設定で管理してください。保存された項目の削除もパスワードマネージャーで行えます。</p>
+          <p>ログアウト・ページ再読み込みで、この画面の認証トークンは破棄されます。大学側のトークンを失効させる操作は行いません。発行されるAPIトークン自体が読み取り専用とは限りません。</p>
+          <p>授業内容APIに掲載されたMoodle内のファイルが対象です。外部サイト・ストリーミング動画・追加認証には対応しません。Web版は毎回新しいZIPを作成し、取得済みファイルとの差分判定はしません。大容量資料や差分取得にはGitHubのCLI版を利用できます。</p>
+          <p>このページの配信元としてGitHub Pagesにも通常のアクセス情報が送られます。ブラウザの拡張機能やパスワード同期機能は、それぞれの設定に従います。</p>
+        </div></details>
+      </footer>
+    </main>
+    <noscript><p class="noscript">このアプリを使うにはJavaScriptを有効にしてください。ログイン情報はまだ送信されていません。</p></noscript>
+  </body>
+</html>

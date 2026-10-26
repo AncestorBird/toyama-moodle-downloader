@@ -17,3 +17,9 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Web development / generated site
+node_modules/
+dist/
+test-results/
+playwright-report/
