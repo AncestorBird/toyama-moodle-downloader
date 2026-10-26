@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""富山大学Moodleの公式APIで授業資料を取得する。Python標準ライブラリのみ。"""
+"""富山大学Moodleの公式APIで授業資料を取得する。認証情報はOSの保管庫に保存。"""
 
 import argparse
 import getpass
@@ -20,6 +20,8 @@ import warnings
 
 SITE = "https://moodle52.u-toyama.ac.jp"
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "moodle_downloads"
+KEYRING_SERVICE = "toyama-moodle-downloader:https://moodle52.u-toyama.ac.jp"
+KEYRING_ACCOUNT = "default"
 READ_FUNCTIONS = {
     "core_webservice_get_site_info",
     "core_enrol_get_users_courses",
@@ -29,6 +31,128 @@ READ_FUNCTIONS = {
 
 class MoodleError(Exception):
     pass
+
+
+class MoodleAPIError(MoodleError):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+class CredentialStore:
+    """ツール専用の1項目にアカウント名とパスワードをまとめて保管する。"""
+
+    def __init__(self):
+        try:
+            import keyring
+        except ImportError:
+            raise MoodleError(
+                "認証情報の保存にはkeyringが必要です。READMEのセットアップ手順を実行するか、"
+                "保存しない場合は --no-save を指定してください。"
+            ) from None
+        try:
+            self.backend = keyring.get_keyring()
+            # keyrings.altなどの平文ファイルへの保存先は受け付けない。
+            allowed = {
+                "darwin": {("keyring.backends.macOS", "Keyring")},
+                "win32": {("keyring.backends.Windows", "WinVaultKeyring")},
+            }.get(sys.platform, {("keyring.backends.SecretService", "Keyring")})
+            kind = (type(self.backend).__module__, type(self.backend).__name__)
+            if kind not in allowed:
+                raise ValueError("unsupported backend")
+        except Exception:
+            raise MoodleError(
+                "OSの認証情報保管庫を利用できません。平文ファイルには保存しません。"
+                "保管庫の設定を確認するか --no-save を指定してください。"
+            ) from None
+
+    def load(self):
+        try:
+            raw = self.backend.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
+            if raw is None:
+                return None
+            data = json.loads(raw)
+            if (not isinstance(data, dict) or data.get("version") != 1
+                    or not isinstance(data.get("username"), str) or not data["username"].strip()
+                    or not isinstance(data.get("password"), str) or not data["password"]):
+                raise ValueError("invalid credential record")
+            return data["username"], data["password"]
+        except Exception:
+            raise MoodleError(
+                "保存済みの認証情報を読み出せません。--login で再登録するか --no-save を指定してください。"
+            ) from None
+
+    def save(self, username, password):
+        try:
+            self.backend.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, json.dumps({
+                "version": 1, "username": username, "password": password,
+            }, ensure_ascii=False))
+        except Exception:
+            raise MoodleError("OSの保管庫への保存に失敗しました。認証情報をファイルには保存していません。") from None
+
+    def forget(self):
+        try:
+            if self.backend.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT) is None:
+                return False
+            self.backend.delete_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
+            return True
+        except Exception:
+            raise MoodleError("保存済みの認証情報を削除できませんでした。OSの保管庫を確認してください。") from None
+
+
+def prompt_credentials():
+    if not sys.stdin.isatty():
+        raise MoodleError("初回ログイン・再入力は手元のターミナルで実行してください。")
+    username = input("Moodleのユーザー名: ").strip()
+    if not username:
+        raise MoodleError("ユーザー名が未入力です。")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            password = getpass.getpass("Moodleのパスワード（入力は非表示）: ")
+        except getpass.GetPassWarning:
+            raise MoodleError("パスワードを非表示にできるターミナルで実行してください。") from None
+    if not password:
+        raise MoodleError("パスワードが未入力です。")
+    return username, password
+
+
+def authenticate(client, args):
+    store = None if args.no_save else CredentialStore()
+    saved = None if store is None or args.login else store.load()
+    if saved:
+        print("保存済みのアカウントでログインします。")
+        username, password = saved
+    else:
+        print("パスワードの入力は非表示です。" + (
+            "認証情報は保存しません。" if store is None
+            else "ログイン成功後、アカウント名とパスワードをOSの保管庫に保存します。"
+        ))
+        username, password = prompt_credentials()
+    try:
+        try:
+            client.login(username, password)
+            info = client.call("core_webservice_get_site_info")
+        except MoodleAPIError as exc:
+            # 保存したパスワードが変わった場合のみ、対話環境で1回だけ再入力する。
+            # 通信エラー・API権限エラーでは認証情報を消したり再送したりしない。
+            if not saved or exc.code != "invalidlogin" or not sys.stdin.isatty():
+                raise
+            saved = None
+            print("保存済みの認証情報ではログインできませんでした。新しい情報を入力してください。")
+            username, password = prompt_credentials()
+            client.login(username, password)
+            info = client.call("core_webservice_get_site_info")
+        if store is not None and not saved:
+            try:
+                store.save(username, password)
+                print("アカウント名とパスワードをOSの保管庫に保存しました。次回から入力を省略します。")
+            except MoodleError as exc:
+                print("注意:", exc, "今回はログインできましたが、次回は再入力が必要です。", file=sys.stderr)
+        return info
+    finally:
+        # Pythonのメモリを完全消去する保証はない。プロセス終了時まで平文を必要以上に保持しない。
+        del username, password, saved
 
 
 def validate_url(url):
@@ -85,7 +209,7 @@ class Client:
                 "servicenotavailable": "このアカウントではモバイルAPIを利用できません。",
                 "forcepasswordchangenotice": "大学のサイトでパスワード変更が必要です。",
             }
-            raise MoodleError(f"Moodle APIエラー: {code}。" + hints.get(code, "アカウントのAPI権限や追加認証を確認してください。"))
+            raise MoodleAPIError(f"Moodle APIエラー: {code}。" + hints.get(code, "アカウントのAPI権限や追加認証を確認してください。"), code)
         return data
 
     def public_config(self):
@@ -230,6 +354,11 @@ def download(client, item, destination, old):
 
 
 def run(args):
+    if args.forget_login:
+        removed = CredentialStore().forget()
+        print("保存済みのアカウント名とパスワードを削除しました。" if removed else "保存済みの認証情報はありません。")
+        print("大学側のAPIトークンは失効させません。")
+        return 0
     client = Client()
     config = client.public_config()
     print("接続先:", config["sitename"])
@@ -240,25 +369,7 @@ def run(args):
     if not config.get("enablemobilewebservice"):
         raise MoodleError("このサイトではモバイルAPIが無効です。")
     print("認証情報の送信先: " + SITE + " （HTTPS）")
-    print("パスワードは画面に表示せず、パスワード・トークンをファイルに保存しません。")
-    if not sys.stdin.isatty():
-        raise MoodleError("ログインは手元のターミナルで実行してください。")
-    username = input("Moodleのユーザー名: ").strip()
-    if not username:
-        raise MoodleError("ユーザー名が未入力です。")
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", getpass.GetPassWarning)
-        try:
-            password = getpass.getpass("Moodleのパスワード（入力は非表示）: ")
-        except getpass.GetPassWarning:
-            raise MoodleError("パスワードを非表示にできるターミナルで実行してください。") from None
-    if not password:
-        raise MoodleError("パスワードが未入力です。")
-    try:
-        client.login(username, password)
-    finally:
-        del password
-    info = client.call("core_webservice_get_site_info")
+    info = authenticate(client, args)
     courses = client.call("core_enrol_get_users_courses", userid=info["userid"])
     courses.sort(key=lambda c: (c.get("startdate", 0), c["id"]), reverse=True)
     print(f"\nログイン成功。登録授業: {len(courses)}件")
@@ -336,6 +447,10 @@ def main():
     parser.add_argument("--course", type=int, action="append", help="取得する授業ID（繰り返し指定可）")
     parser.add_argument("--dry-run", action="store_true", help="資料一覧のみ確認し、保存しない")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="保存先")
+    auth = parser.add_mutually_exclusive_group()
+    auth.add_argument("--login", action="store_true", help="認証情報を再入力し、ログイン成功後に保存し直す")
+    auth.add_argument("--no-save", action="store_true", help="保存情報を読み書きせず、今回だけ手入力する")
+    auth.add_argument("--forget-login", action="store_true", help="保存済みの認証情報を削除して終了（通信なし）")
     args = parser.parse_args()
     # ダウンロードした資料は本人だけが読める権限で作成。
     os.umask(0o077)

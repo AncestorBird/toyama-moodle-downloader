@@ -1,0 +1,2 @@
+# Store credentials in the OS keychain; no plaintext fallback.
+keyring>=25,<26
