@@ -7,8 +7,9 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.parse
 
 import moodle_download as moodle
@@ -60,7 +61,8 @@ class DownloadTests(unittest.TestCase):
         FakeClient.reads = 0
 
     def run_tool(self, output, **kwargs):
-        args = argparse.Namespace(check=False, list=False, course=[123], dry_run=False, output=output)
+        args = argparse.Namespace(check=False, list=False, course=[123], dry_run=False, output=output,
+                                  no_save=True, login=False, forget_login=False)
         for key, value in kwargs.items():
             setattr(args, key, value)
         with (patch.object(moodle, "Client", FakeClient),
@@ -158,6 +160,128 @@ class DownloadTests(unittest.TestCase):
             with self.assertRaises(moodle.MoodleError):
                 self.run_tool(root)
             self.assertFalse((Path(folder) / "outside.pdf").exists())
+
+
+class MemoryBackend:
+    """テスト専用。OSの実際の保管庫を読み書きしない。"""
+
+    def __init__(self):
+        self.raw = None
+
+    def get_password(self, service, account):
+        assert service == moodle.KEYRING_SERVICE and account == moodle.KEYRING_ACCOUNT
+        return self.raw
+
+    def set_password(self, service, account, value):
+        assert service == moodle.KEYRING_SERVICE and account == moodle.KEYRING_ACCOUNT
+        self.raw = value
+
+    def delete_password(self, service, account):
+        assert service == moodle.KEYRING_SERVICE and account == moodle.KEYRING_ACCOUNT
+        self.raw = None
+
+
+class AuthenticationTests(unittest.TestCase):
+    def setUp(self):
+        self.store = moodle.CredentialStore.__new__(moodle.CredentialStore)
+        self.store.backend = MemoryBackend()
+        self.args = argparse.Namespace(no_save=False, login=False, forget_login=False)
+        self.client = Mock()
+        self.client.call.return_value = {"userid": 10}
+
+    def authenticate(self, username="test-user", password="test-password", interactive=True):
+        with (patch.object(moodle, "CredentialStore", return_value=self.store),
+              patch("builtins.input", return_value=username) as user_prompt,
+              patch.object(moodle.getpass, "getpass", return_value=password) as password_prompt,
+              patch.object(moodle.sys.stdin, "isatty", return_value=interactive),
+              redirect_stdout(io.StringIO()) as log):
+            info = moodle.authenticate(self.client, self.args)
+        self.assertNotIn(password, log.getvalue())
+        return info, user_prompt, password_prompt
+
+    def test_first_success_is_saved_and_next_run_needs_no_input(self):
+        info, user_prompt, password_prompt = self.authenticate()
+        self.assertEqual(info, {"userid": 10})
+        self.assertEqual(self.store.load(), ("test-user", "test-password"))
+        user_prompt.assert_called_once()
+        password_prompt.assert_called_once()
+        self.client.login.assert_called_once_with("test-user", "test-password")
+        self.client.reset_mock()
+        _, user_prompt, password_prompt = self.authenticate(interactive=False)
+        user_prompt.assert_not_called()
+        password_prompt.assert_not_called()
+        self.client.login.assert_called_once_with("test-user", "test-password")
+
+    def test_failed_first_login_is_not_saved(self):
+        self.client.login.side_effect = moodle.MoodleAPIError("invalid credentials", "invalidlogin")
+        with self.assertRaises(moodle.MoodleAPIError):
+            self.authenticate()
+        self.assertIsNone(self.store.load())
+
+    def test_saved_password_change_prompts_once_and_replaces_after_success(self):
+        self.store.save("old-user", "old-password")
+        self.client.login.side_effect = [moodle.MoodleAPIError("invalid", "invalidlogin"), None]
+        _, user_prompt, password_prompt = self.authenticate("new-user", "new-password")
+        self.assertEqual(self.client.login.call_count, 2)
+        user_prompt.assert_called_once()
+        password_prompt.assert_called_once()
+        self.assertEqual(self.store.load(), ("new-user", "new-password"))
+
+    def test_network_failure_does_not_retry_or_replace_saved_login(self):
+        self.store.save("test-user", "test-password")
+        self.client.login.side_effect = moodle.MoodleError("network unavailable")
+        with self.assertRaises(moodle.MoodleError):
+            self.authenticate()
+        self.client.login.assert_called_once()
+        self.assertEqual(self.store.load(), ("test-user", "test-password"))
+
+    def test_no_save_never_reads_or_writes_store(self):
+        self.args.no_save = True
+        self.store.save("old-user", "old-password")
+        with patch.object(moodle, "CredentialStore", side_effect=AssertionError("must not touch keychain")):
+            with (patch("builtins.input", return_value="test-user"),
+                  patch.object(moodle.getpass, "getpass", return_value="test-password"),
+                  patch.object(moodle.sys.stdin, "isatty", return_value=True),
+                  redirect_stdout(io.StringIO())):
+                moodle.authenticate(self.client, self.args)
+        self.assertEqual(self.store.load(), ("old-user", "old-password"))
+
+    def test_explicit_login_bypasses_corrupt_saved_credentials(self):
+        self.store.backend.raw = "broken record"
+        self.args.login = True
+        self.authenticate()
+        self.assertEqual(self.store.load(), ("test-user", "test-password"))
+
+    def test_forget_login_does_not_contact_moodle(self):
+        self.store.save("test-user", "test-password")
+        self.args.forget_login = True
+        with (patch.object(moodle, "CredentialStore", return_value=self.store),
+              patch.object(moodle, "Client", side_effect=AssertionError("network must not be used")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(moodle.run(self.args), 0)
+        self.assertIsNone(self.store.load())
+        self.assertFalse(self.store.forget())
+
+    def test_plaintext_backend_is_rejected(self):
+        module = types.SimpleNamespace(get_keyring=lambda: MemoryBackend())
+        with patch.dict(moodle.sys.modules, {"keyring": module}):
+            with self.assertRaisesRegex(moodle.MoodleError, "平文ファイルには保存しません"):
+                moodle.CredentialStore()
+
+    def test_store_failure_does_not_leak_password_or_block_this_login(self):
+        with (patch.object(self.store.backend, "set_password", side_effect=RuntimeError("test-password")),
+              patch.object(moodle.sys, "stderr", new_callable=io.StringIO) as log):
+            self.authenticate()
+        self.assertNotIn("test-password", log.getvalue())
+        self.assertIn("次回は再入力", log.getvalue())
+        self.assertIsNone(self.store.load())
+
+    def test_public_check_does_not_touch_credentials(self):
+        self.args.check = True
+        with (patch.object(moodle, "Client", FakeClient),
+              patch.object(moodle, "CredentialStore", side_effect=AssertionError("must not read credentials")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(moodle.run(self.args), 0)
 
 
 if __name__ == "__main__":
