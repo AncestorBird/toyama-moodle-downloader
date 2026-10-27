@@ -66,12 +66,13 @@ class DownloadTests(unittest.TestCase):
         for key, value in kwargs.items():
             setattr(args, key, value)
         with (patch.object(moodle, "Client", FakeClient),
-              patch("builtins.input", return_value="test-user"),
-              patch.object(moodle.getpass, "getpass", return_value="test-password"),
+              patch("builtins.input", side_effect=AssertionError("credentials must not use visible input")),
+              patch.object(moodle.getpass, "getpass", side_effect=["test-user", "test-password"]),
               patch.object(moodle.sys.stdin, "isatty", return_value=True),
               redirect_stdout(io.StringIO()) as log):
             result = moodle.run(args)
         self.assertNotIn("test-password", log.getvalue())
+        self.assertNotIn("test-user", log.getvalue())
         return result
 
     def test_download_skip_update_and_preserve_local_changes(self):
@@ -191,20 +192,21 @@ class AuthenticationTests(unittest.TestCase):
 
     def authenticate(self, username="test-user", password="test-password", interactive=True):
         with (patch.object(moodle, "CredentialStore", return_value=self.store),
-              patch("builtins.input", return_value=username) as user_prompt,
-              patch.object(moodle.getpass, "getpass", return_value=password) as password_prompt,
+              patch("builtins.input", side_effect=AssertionError("credentials must not use visible input")) as user_prompt,
+              patch.object(moodle.getpass, "getpass", side_effect=[username, password]) as password_prompt,
               patch.object(moodle.sys.stdin, "isatty", return_value=interactive),
               redirect_stdout(io.StringIO()) as log):
             info = moodle.authenticate(self.client, self.args)
         self.assertNotIn(password, log.getvalue())
+        self.assertNotIn(username, log.getvalue())
         return info, user_prompt, password_prompt
 
     def test_first_success_is_saved_and_next_run_needs_no_input(self):
         info, user_prompt, password_prompt = self.authenticate()
         self.assertEqual(info, {"userid": 10})
         self.assertEqual(self.store.load(), ("test-user", "test-password"))
-        user_prompt.assert_called_once()
-        password_prompt.assert_called_once()
+        user_prompt.assert_not_called()
+        self.assertEqual(password_prompt.call_count, 2)
         self.client.login.assert_called_once_with("test-user", "test-password")
         self.client.reset_mock()
         _, user_prompt, password_prompt = self.authenticate(interactive=False)
@@ -223,8 +225,8 @@ class AuthenticationTests(unittest.TestCase):
         self.client.login.side_effect = [moodle.MoodleAPIError("invalid", "invalidlogin"), None]
         _, user_prompt, password_prompt = self.authenticate("new-user", "new-password")
         self.assertEqual(self.client.login.call_count, 2)
-        user_prompt.assert_called_once()
-        password_prompt.assert_called_once()
+        user_prompt.assert_not_called()
+        self.assertEqual(password_prompt.call_count, 2)
         self.assertEqual(self.store.load(), ("new-user", "new-password"))
 
     def test_network_failure_does_not_retry_or_replace_saved_login(self):
@@ -239,8 +241,8 @@ class AuthenticationTests(unittest.TestCase):
         self.args.no_save = True
         self.store.save("old-user", "old-password")
         with patch.object(moodle, "CredentialStore", side_effect=AssertionError("must not touch keychain")):
-            with (patch("builtins.input", return_value="test-user"),
-                  patch.object(moodle.getpass, "getpass", return_value="test-password"),
+            with (patch("builtins.input", side_effect=AssertionError("credentials must not use visible input")),
+                  patch.object(moodle.getpass, "getpass", side_effect=["test-user", "test-password"]),
                   patch.object(moodle.sys.stdin, "isatty", return_value=True),
                   redirect_stdout(io.StringIO())):
                 moodle.authenticate(self.client, self.args)
@@ -282,6 +284,37 @@ class AuthenticationTests(unittest.TestCase):
               patch.object(moodle, "CredentialStore", side_effect=AssertionError("must not read credentials")),
               redirect_stdout(io.StringIO())):
             self.assertEqual(moodle.run(self.args), 0)
+
+
+class CredentialPromptTests(unittest.TestCase):
+    def test_both_fields_are_hidden_and_only_username_is_trimmed(self):
+        with (patch.object(moodle.sys.stdin, "isatty", return_value=True),
+              patch("builtins.input", side_effect=AssertionError("visible input is forbidden")),
+              patch.object(moodle.getpass, "getpass", side_effect=[" user ", " pass "]) as hidden):
+            self.assertEqual(moodle.prompt_credentials(), ("user", " pass "))
+        self.assertEqual(hidden.call_count, 2)
+
+    def test_echo_warning_in_either_field_stops_login(self):
+        for replies in ([moodle.getpass.GetPassWarning()], ["user", moodle.getpass.GetPassWarning()]):
+            with self.subTest(field=len(replies)), \
+                    patch.object(moodle.sys.stdin, "isatty", return_value=True), \
+                    patch.object(moodle.getpass, "getpass", side_effect=replies):
+                with self.assertRaisesRegex(moodle.MoodleError, "非表示にできるターミナル"):
+                    moodle.prompt_credentials()
+
+    def test_noninteractive_input_is_rejected_before_prompting(self):
+        with (patch.object(moodle.sys.stdin, "isatty", return_value=False),
+              patch.object(moodle.getpass, "getpass") as hidden):
+            with self.assertRaises(moodle.MoodleError):
+                moodle.prompt_credentials()
+        hidden.assert_not_called()
+
+    def test_empty_username_does_not_prompt_for_password(self):
+        with (patch.object(moodle.sys.stdin, "isatty", return_value=True),
+              patch.object(moodle.getpass, "getpass", return_value="  ") as hidden):
+            with self.assertRaisesRegex(moodle.MoodleError, "ユーザー名が未入力"):
+                moodle.prompt_credentials()
+        hidden.assert_called_once()
 
 
 if __name__ == "__main__":

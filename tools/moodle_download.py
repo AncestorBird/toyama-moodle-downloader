@@ -103,15 +103,15 @@ class CredentialStore:
 def prompt_credentials():
     if not sys.stdin.isatty():
         raise MoodleError("初回ログイン・再入力は手元のターミナルで実行してください。")
-    username = input("Moodleのユーザー名: ").strip()
-    if not username:
-        raise MoodleError("ユーザー名が未入力です。")
     with warnings.catch_warnings():
         warnings.simplefilter("error", getpass.GetPassWarning)
         try:
+            username = getpass.getpass("Moodleのユーザー名（入力は非表示）: ").strip()
+            if not username:
+                raise MoodleError("ユーザー名が未入力です。")
             password = getpass.getpass("Moodleのパスワード（入力は非表示）: ")
         except getpass.GetPassWarning:
-            raise MoodleError("パスワードを非表示にできるターミナルで実行してください。") from None
+            raise MoodleError("ユーザー名・パスワードを非表示にできるターミナルで実行してください。") from None
     if not password:
         raise MoodleError("パスワードが未入力です。")
     return username, password
@@ -124,7 +124,7 @@ def authenticate(client, args):
         print("保存済みのアカウントでログインします。")
         username, password = saved
     else:
-        print("パスワードの入力は非表示です。" + (
+        print("ユーザー名・パスワードの入力は非表示です。" + (
             "認証情報は保存しません。" if store is None
             else "ログイン成功後、アカウント名とパスワードをOSの保管庫に保存します。"
         ))
