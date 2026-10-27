@@ -386,7 +386,7 @@ def download(client, item, destination, old, *, budget=None):
     # Pin directories before the request: a concurrent symlink replacement must
     # never redirect temporary files or final links into another directory.
     with Directory(destination.parent, create=True) as directory:
-        with client.file_response(item["fileurl"]) as response, directory.temporary() as (temporary, stream):
+        with directory.temporary() as (temporary, stream), client.file_response(item["fileurl"]) as response:
             header_size = response.headers.get("Content-Length")
             if header_size and (not re.fullmatch(r"[0-9]{1,16}", header_size) or int(header_size) > limit):
                 raise MoodleError("応答サイズが容量上限または宣言サイズを超えています。")

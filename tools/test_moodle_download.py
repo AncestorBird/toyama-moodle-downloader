@@ -92,13 +92,13 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(len(list(root.rglob("*.pdf"))), 2)
             self.assertEqual(self.run_tool(root), 0)
             self.assertEqual(FakeClient.reads, 2)
-            manifest = json.loads((root / ".manifest.json").read_text())
+            manifest = json.loads((root / ".manifest.json").read_text(encoding="utf-8"))
             latest = Path(next(iter(manifest.values()))["path"])
             latest.write_bytes(b"my local edits")
             self.assertEqual(self.run_tool(root), 0)
             self.assertEqual(latest.read_bytes(), b"my local edits")
             self.assertEqual(len(list(root.rglob("*.pdf"))), 3)
-            self.assertNotIn("test-password", (root / ".manifest.json").read_text())
+            self.assertNotIn("test-password", (root / ".manifest.json").read_text(encoding="utf-8"))
 
     def test_preview_does_not_write_files(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -157,7 +157,7 @@ class DownloadTests(unittest.TestCase):
             root = Path(folder).resolve() / "downloads"
             self.run_tool(root)
             manifest_path = root / ".manifest.json"
-            manifest = json.loads(manifest_path.read_text())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             next(iter(manifest.values()))["path"] = str(Path(folder).resolve() / "outside.pdf")
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaises(moodle.MoodleError):
@@ -344,7 +344,7 @@ class SecurityTests(unittest.TestCase):
             moodle.write_json(history, {"safe": True})
             self.assertEqual(secret.read_bytes(), b"unchanged")
             self.assertFalse(history.is_symlink())
-            self.assertEqual(json.loads(history.read_text()), {"safe": True})
+            self.assertEqual(json.loads(history.read_text(encoding="utf-8")), {"safe": True})
 
     @unittest.skipUnless(os.name == "nt", "Windows junctions only")
     def test_windows_junction_parent_is_refused(self):

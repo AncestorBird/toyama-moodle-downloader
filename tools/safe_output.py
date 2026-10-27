@@ -28,7 +28,10 @@ if os.name == "nt":
     _kernel.CloseHandle.restype = wintypes.BOOL
 
     def _windows_handle(path, directory):
-        handle = _kernel.CreateFileW(str(path), 0x80 if directory else 0x80000000,
+        # Attribute-only access does not participate in Windows share checks.
+        # GENERIC_READ includes FILE_LIST_DIRECTORY, so denying SHARE_DELETE
+        # actually pins directories against rename/removal.
+        handle = _kernel.CreateFileW(str(path), 0x80000000,
                                      3, None, 3, 0x02200000, None)
         if handle == wintypes.HANDLE(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())
