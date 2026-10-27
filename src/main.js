@@ -95,7 +95,9 @@ function errorMessage(error) {
 }
 
 const canStorePassword = typeof window.PasswordCredential === 'function' && !!navigator.credentials?.store;
+const canSaveDirectly = typeof window.showSaveFilePicker === 'function';
 $('remember-option').hidden = !canStorePassword;
+if (canSaveDirectly) document.querySelector('.download-hint').append(' ZIPの保存先を選んでから取得します。');
 
 $('show-password').addEventListener('click', () => {
   const show = $('password').type === 'password';
@@ -187,7 +189,19 @@ $('download-button').addEventListener('click', async () => {
   clearArchive();
   $('activity-log').replaceChildren();
   busy(true);
+  let writable = null;
   try {
+    const now = new Date();
+    const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const filename = `moodle-materials-${date}.zip`;
+    if (!preview && canSaveDirectly) {
+      status('ZIPの保存先を選んでください。');
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: 'ZIPファイル', accept: { 'application/zip': ['.zip'] } }],
+      });
+      writable = await handle.createWritable();
+    }
     const materials = await collectMaterials(session.client, courses, {
       signal: controller.signal,
       onCourse: course => status(`${cleanName(course.fullname)} の資料一覧を確認しています…`),
@@ -202,7 +216,7 @@ $('download-button').addEventListener('click', async () => {
       return;
     }
     const result = await createArchive(session.client, materials, {
-      signal: controller.signal,
+      signal: controller.signal, writable,
       onProgress: progress => {
         if (progress.stage === 'zip') {
           $('progress').removeAttribute('value');
@@ -216,21 +230,22 @@ $('download-button').addEventListener('click', async () => {
         }
       },
     });
+    writable = null;
     if (result.blob) {
-      const now = new Date();
-      const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
       archiveURL = URL.createObjectURL(result.blob);
       $('archive-link').href = archiveURL;
-      $('archive-link').download = `moodle-materials-${date}.zip`;
+      $('archive-link').download = filename;
       $('archive-link').hidden = false;
       $('archive-link').click();
     }
     status(result.saved
-      ? `ZIPを作成しました。取得 ${result.saved}件 / 失敗 ${result.failures.length}件 · ${formatBytes(result.bytes)}`
+      ? `ZIPを${result.direct ? '保存' : '作成'}しました。取得 ${result.saved}件 / 失敗 ${result.failures.length}件 · ${formatBytes(result.bytes)}`
       : `資料を取得できませんでした。失敗 ${result.failures.length}件。取得結果を確認してください。`, !!result.failures.length);
   } catch (error) {
+    if (error?.name === 'AbortError') error = new CancelledError();
     status(errorMessage(error), !(error instanceof CancelledError));
   } finally {
+    await writable?.abort().catch(() => {});
     operation = null;
     busy(false);
   }

@@ -12,6 +12,7 @@ const courses = [
 ];
 
 async function mockMoodle(page, { invalidLogin = false } = {}) {
+  await page.addInitScript(() => { window.showSaveFilePicker = undefined; });
   const requests = [];
   await page.route(`${SITE}/**`, async route => {
     const request = route.request();
@@ -54,6 +55,7 @@ test('login, select, download a valid ZIP, then log out without retaining secret
   const requests = await mockMoodle(page);
   await page.goto('./');
   await expect(page.locator('h1')).toContainText('授業の資料を、');
+  await expect(page.locator('.download-hint')).toContainText('合計1 GB');
   await expect(page.locator('.brand-icon')).toHaveCSS('background-color', 'rgb(23, 100, 90)');
   await signIn(page);
   await expect(page.locator('.course-row')).toHaveCount(3);
@@ -82,6 +84,47 @@ test('login, select, download a valid ZIP, then log out without retaining secret
   await expect(page.locator('#download-button')).toBeDisabled();
   await expect(page.locator('#archive-link')).toBeHidden();
   expect(errors).toEqual([]);
+});
+
+test('supported browsers select a destination and stream a valid ZIP into it', async ({ page }) => {
+  await mockMoodle(page);
+  await page.addInitScript(() => {
+    window.directSaveTest = { chunks: [], closed: false, aborted: false };
+    window.showSaveFilePicker = async options => {
+      window.directSaveTest.filename = options.suggestedName;
+      return { createWritable: async () => ({
+        write: async bytes => window.directSaveTest.chunks.push(Array.from(bytes)),
+        close: async () => { window.directSaveTest.closed = true; },
+        abort: async () => { window.directSaveTest.aborted = true; },
+      }) };
+    };
+  });
+  await page.goto('./');
+  await signIn(page);
+  await page.locator('.course-row').first().getByRole('checkbox').check();
+  await page.getByRole('button', { name: '選択した授業の資料を取得' }).click();
+  await expect(page.getByRole('status')).toContainText('ZIPを保存しました。取得 1件 / 失敗 0件');
+  const result = await page.evaluate(() => window.directSaveTest);
+  expect(result.closed).toBe(true);
+  expect(result.aborted).toBe(false);
+  expect(result.filename).toMatch(/^moodle-materials-\d{4}-\d{2}-\d{2}\.zip$/);
+  const zip = unzipSync(Uint8Array.from(result.chunks.flat()));
+  expect(Buffer.from(Object.values(zip)[0])).toEqual(pdf);
+  await expect(page.locator('#archive-link')).toBeHidden();
+});
+
+test('cancelling the save dialog does not request course contents or files', async ({ page }) => {
+  const requests = await mockMoodle(page);
+  await page.addInitScript(() => {
+    window.showSaveFilePicker = async () => { throw new DOMException('cancelled', 'AbortError'); };
+  });
+  await page.goto('./');
+  await signIn(page);
+  await page.locator('.course-row').first().getByRole('checkbox').check();
+  await page.getByRole('button', { name: '選択した授業の資料を取得' }).click();
+  await expect(page.getByRole('status')).toContainText('取得を中止');
+  expect(requests.filter(r => r.url.includes('/pluginfile.php/') || r.params.get('wsfunction') === 'core_course_get_contents')).toHaveLength(0);
+  await expect(page.locator('#download-button')).toBeEnabled();
 });
 
 test('search selects only visible courses, and preview does not request files', async ({ page }) => {

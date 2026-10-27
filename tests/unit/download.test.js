@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { unzipSync } from 'fflate';
 import { CancelledError, MoodleError, SITE } from '../../src/api.js';
-import { cleanName, collectMaterials, createArchive } from '../../src/download.js';
+import { cleanName, collectMaterials, createArchive, formatBytes, MAX_ARCHIVE_BYTES } from '../../src/download.js';
 
 const item = { type: 'file', filename: '../資料.pdf', filepath: '/', fileurl: SITE + '/pluginfile.php/1/file.pdf', filesize: 3 };
 const materials = [{ item, path: '授業/資料.pdf', name: '資料.pdf', course: '授業' }];
@@ -42,6 +42,8 @@ test('a failed file is reported while successful files remain available', async 
   assert.equal(result.saved, 1);
   assert.equal(result.failures[0].message, '取得エラー');
   assert.ok(result.blob);
+  const zip = unzipSync(new Uint8Array(await result.blob.arrayBuffer()));
+  assert.deepEqual(Object.keys(zip), ['授業/資料.pdf']);
 });
 
 test('cancellation produces no archive and stops further downloads', async () => {
@@ -55,8 +57,91 @@ test('cancellation produces no archive and stops further downloads', async () =>
 test('oversized batches are rejected before downloading', async () => {
   let called = false;
   const client = { file: async () => { called = true; } };
-  await assert.rejects(createArchive(client, [{ ...materials[0], item: { filesize: 201 * 1024 * 1024 } }]), /200 MB/);
+  await assert.rejects(createArchive(client, [{ ...materials[0], item: { filesize: MAX_ARCHIVE_BYTES + 1 } }]), /1 GB/);
   assert.equal(called, false);
+});
+
+test('declared batches above 200 MiB and at exactly 1 GiB reach the download step', async () => {
+  assert.equal(MAX_ARCHIVE_BYTES, 1024 * 1024 * 1024);
+  for (const sizes of [Array(6).fill(40 * 1024 * 1024), [...Array(20).fill(50 * 1024 * 1024), 24 * 1024 * 1024]]) {
+    const reachedDownload = new Error('test stops before allocating large file bodies');
+    let calls = 0;
+    const client = { file: async () => { calls++; throw reachedDownload; } };
+    const batch = sizes.map((filesize, index) => ({ ...materials[0], path: `file-${index}`, item: { ...item, filesize } }));
+    await assert.rejects(createArchive(client, batch), error => error === reachedDownload);
+    assert.equal(calls, 1);
+  }
+});
+
+test('incremental ZIP snapshots each completed file before the next buffer is reused', async () => {
+  const buffer = new Uint8Array(3);
+  let calls = 0;
+  const client = { file: async () => { buffer.fill(++calls); return buffer; } };
+  const batch = ['first.pdf', 'second.pdf', 'third.pdf'].map(path => ({ ...materials[0], path }));
+  const result = await createArchive(client, batch);
+  const zip = unzipSync(new Uint8Array(await result.blob.arrayBuffer()));
+  assert.equal(result.bytes, 9);
+  assert.equal(result.saved, 3);
+  for (const [index, { path }] of batch.entries()) assert.deepEqual(zip[path], new Uint8Array(3).fill(index + 1));
+});
+
+test('cancellation between ZIP entries and before finalization produces no archive', async () => {
+  for (const stage of ['saved', 'zip']) {
+    const controller = new AbortController();
+    let calls = 0;
+    await assert.rejects(createArchive({ file: async () => { calls++; return new Uint8Array([1]); } }, materials, {
+      signal: controller.signal,
+      onProgress: progress => { if (progress.stage === stage) controller.abort(); },
+    }), CancelledError);
+    assert.equal(calls, 1);
+  }
+});
+
+test('large sizes are shown in gigabytes', () => {
+  assert.equal(formatBytes(MAX_ARCHIVE_BYTES), '1.0 GB');
+  assert.equal(formatBytes(50 * 1024 * 1024), '50.0 MB');
+});
+
+test('direct saving writes each file before downloading the next and closes a valid ZIP', async () => {
+  const chunks = [];
+  let closed = false;
+  const writable = {
+    write: async chunk => { await Promise.resolve(); chunks.push(chunk.slice()); },
+    close: async () => { closed = true; },
+    abort: async () => { assert.fail('successful ZIP must not abort'); },
+  };
+  let calls = 0;
+  const client = { file: async () => {
+    if (calls) assert.ok(chunks.length > 0, 'previous file must already be written');
+    return new Uint8Array([++calls]);
+  } };
+  const result = await createArchive(client, [...materials, { ...materials[0], path: 'second.pdf' }], { writable });
+  assert.equal(result.direct, true);
+  assert.equal(result.blob, null);
+  assert.equal(closed, true);
+  const zip = unzipSync(new Uint8Array(await new Blob(chunks).arrayBuffer()));
+  assert.deepEqual(zip['授業/資料.pdf'], new Uint8Array([1]));
+  assert.deepEqual(zip['second.pdf'], new Uint8Array([2]));
+});
+
+test('direct saving aborts on cancellation, write failure, or invalid batch', async () => {
+  for (const mode of ['cancel', 'write-error', 'oversized']) {
+    const controller = new AbortController();
+    let aborted = false, closed = false;
+    const failure = new Error('mock disk failure');
+    const writable = {
+      write: async () => { if (mode === 'write-error') throw failure; },
+      close: async () => { closed = true; },
+      abort: async () => { aborted = true; },
+    };
+    const batch = mode === 'oversized' ? [{ ...materials[0], item: { filesize: MAX_ARCHIVE_BYTES + 1 } }] : materials;
+    await assert.rejects(createArchive({ file: async () => new Uint8Array([1]) }, batch, {
+      writable, signal: controller.signal,
+      onProgress: progress => { if (mode === 'cancel' && progress.stage === 'zip') controller.abort(); },
+    }), error => mode === 'write-error' ? error === failure : error instanceof MoodleError);
+    assert.equal(aborted, true);
+    assert.equal(closed, false);
+  }
 });
 
 test('empty material lists do not create empty ZIPs', async () => {
