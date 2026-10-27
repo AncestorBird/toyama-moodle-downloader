@@ -9,19 +9,62 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import sys
-import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
+
+from safe_output import Directory
 
 
 SITE = "https://moodle52.u-toyama.ac.jp"
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "moodle_downloads"
 KEYRING_SERVICE = "toyama-moodle-downloader:https://moodle52.u-toyama.ac.jp"
 KEYRING_ACCOUNT = "default"
+MAX_FILE_BYTES = 250 * 1024 * 1024
+MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILE_SECONDS = 120
+MAX_TOTAL_SECONDS = 30 * 60
+
+
+class TransferBudget:
+    def __init__(self):
+        self.received = 0
+        self.deadline = time.monotonic() + MAX_TOTAL_SECONDS
+
+    def check(self):
+        if time.monotonic() >= self.deadline:
+            raise MoodleError("取得全体の制限時間（30分）を超えました。授業を分けて取得してください。")
+
+    def consume(self, size):
+        self.received += size
+        self.check()
+        if self.received > MAX_TOTAL_BYTES:
+            raise MoodleError("受信合計が2 GiBの上限を超えました。授業を分けて取得してください。")
+
+
+def bounded_chunks(response, limit, deadline, on_chunk=lambda size: None):
+    """read1 returns after one socket read, so trickling cannot reset the deadline."""
+    received = 0
+    read = getattr(response, "read1", response.read)
+    while True:
+        if time.monotonic() >= deadline:
+            raise MoodleError("応答の制限時間を超えたため取得を中止しました。")
+        chunk = read(min(65536, limit - received + 1))
+        if chunk:
+            on_chunk(len(chunk))
+        if time.monotonic() >= deadline:
+            raise MoodleError("応答の制限時間を超えたため取得を中止しました。")
+        if not chunk:
+            return
+        received += len(chunk)
+        if received > limit:
+            raise MoodleError("応答サイズが上限または宣言サイズを超えたため中止しました。")
+        yield chunk
+
+
 READ_FUNCTIONS = {
     "core_webservice_get_site_info",
     "core_enrol_get_users_courses",
@@ -192,9 +235,7 @@ class Client:
 
     def json(self, url, params, *, json_body=False):
         with self.open(url, params, json_body=json_body) as response:
-            raw = response.read(8 * 1024 * 1024 + 1)
-        if len(raw) > 8 * 1024 * 1024:
-            raise MoodleError("API応答が上限サイズを超えました。")
+            raw = b"".join(bounded_chunks(response, 8 * 1024 * 1024, time.monotonic() + 45))
         try:
             data = json.loads(raw)
         except (ValueError, UnicodeError):
@@ -233,6 +274,8 @@ class Client:
             raise MoodleError("このツールは指定された読み取り用APIのみ実行できます。")
         if not self.token:
             raise MoodleError("ログインが必要です。")
+        if {"wstoken", "wsfunction", "moodlewsrestformat"}.intersection(params):
+            raise MoodleError("APIの予約パラメーターは指定できません。")
         return self.json(SITE + "/webservice/rest/server.php", {
             "wstoken": self.token, "wsfunction": function,
             "moodlewsrestformat": "json", **params,
@@ -253,17 +296,23 @@ class Client:
 
 
 def clean_name(value):
-    text = html.unescape(re.sub(r"<[^>]*>", "", str(value)))
+    text = html.unescape(re.sub(r"<[^<>]*>", "", str(value)))
     text = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]', "_", text).strip(" .")
     # 日本語のファイル名でもファイルシステムの1要素の制限内にする。
-    while len(text.encode("utf-8")) > 160:
-        text = text[:-1]
-    return text or "名称なし"
+    return text.encode("utf-8")[:160].decode("utf-8", errors="ignore").rstrip(" .") or "名称なし"
+
+
+def require_id(value):
+    if type(value) is not int or not 0 < value <= 2**53 - 1:
+        raise MoodleError("資料のIDが正しくありません。")
 
 
 def material_files(course, sections):
+    require_id(course["id"])
     for section in sections:
+        require_id(section["id"])
         for module in section.get("modules", []):
+            require_id(module["id"])
             if module.get("uservisible") is False:
                 continue
             for item in module.get("contents", []):
@@ -284,73 +333,106 @@ def material_files(course, sections):
                 yield item, relative
 
 
+def stream_digest(stream):
+    digest = hashlib.sha256()
+    for chunk in bounded_chunks(stream, MAX_FILE_BYTES, time.monotonic() + MAX_FILE_SECONDS):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def sha256(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    with Directory(path.parent) as directory, directory.open_read(path.name) as stream:
+        return stream_digest(stream)
 
 
 def write_json(path, value):
-    # 途中終了で履歴を壊さないよう、同じディレクトリの一時ファイルから置き換える。
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
-        temporary = Path(f.name)
-        try:
-            json.dump(value, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with Directory(path.parent) as directory, directory.temporary() as (name, stream):
+        stream.write((json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        stream.close()
+        if not directory.is_current():
+            raise MoodleError("保存先が変更されたため中止しました。")
+        directory.replace(name, path.name)
 
 
-def download(client, item, destination, old):
+def declared_size(item):
+    value = item.get("filesize")
+    if value is None:
+        return None
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,16}", value):
+        return int(value)
+    raise MoodleError("資料のファイルサイズが正しくありません。")
+
+
+def download(client, item, destination, old, *, budget=None):
+    budget = budget or TransferBudget()
+    budget.check()
     stamp = {"timemodified": item.get("timemodified"), "filesize": item.get("filesize")}
     previous = Path(old["path"]) if old and old.get("path") else destination
-    if (old and stamp == {k: old.get(k) for k in stamp} and previous.is_file()
-            and not previous.is_symlink() and sha256(previous) == old.get("sha256")):
-        return old, "skip"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with client.file_response(item["fileurl"]) as response:
-            first = response.read(65536)
-            # ログインページやAPIエラーを資料ファイルとして保存しない。
+    if old and stamp == {k: old.get(k) for k in stamp}:
+        try:
+            if sha256(previous) == old.get("sha256"):
+                return old, "skip"
+        except FileNotFoundError:
+            pass
+    size = declared_size(item)
+    limit = min(MAX_FILE_BYTES, MAX_TOTAL_BYTES - budget.received)
+    if size is not None:
+        if size > limit:
+            raise MoodleError("資料が容量上限（1ファイル250 MiB・受信合計2 GiB）を超えます。")
+        limit = min(limit, size)
+    deadline = min(time.monotonic() + MAX_FILE_SECONDS, budget.deadline)
+    # Pin directories before the request: a concurrent symlink replacement must
+    # never redirect temporary files or final links into another directory.
+    with Directory(destination.parent, create=True) as directory:
+        with client.file_response(item["fileurl"]) as response, directory.temporary() as (temporary, stream):
+            header_size = response.headers.get("Content-Length")
+            if header_size and (not re.fullmatch(r"[0-9]{1,16}", header_size) or int(header_size) > limit):
+                raise MoodleError("応答サイズが容量上限または宣言サイズを超えています。")
             media_type = response.headers.get_content_type()
             if media_type == "text/html" and not str(item.get("mimetype", "")).startswith("text/html"):
                 raise MoodleError("資料の代わりにHTMLページが返りました。")
+            digest = hashlib.sha256()
+            received = 0
+            prefix = bytearray()
+            for chunk in bounded_chunks(response, limit, deadline, budget.consume):
+                if len(prefix) < 65536:
+                    prefix.extend(chunk[:65536 - len(prefix)])
+                received += len(chunk)
+                digest.update(chunk)
+                stream.write(chunk)
+            stream.close()
             try:
-                error = json.loads(first)
+                error = json.loads(prefix)
             except (ValueError, UnicodeError):
                 error = None
             if isinstance(error, dict) and error.get("errorcode") and (error.get("exception") or error.get("message")):
                 raise MoodleError("資料の取得時にMoodleからAPIエラーが返りました。")
-            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as f:
-                temporary = Path(f.name)
-                f.write(first)
-                shutil.copyfileobj(response, f)
-        if item.get("filesize") is not None and temporary.stat().st_size != int(item["filesize"]):
-            raise MoodleError("ファイルサイズが一致しないため保存を中止しました。")
-        digest = sha256(temporary)
-        # 既存のファイル（手元で編集したファイルを含む）を上書きしない。
-        target = destination
-        if target.exists() or target.is_symlink():
-            target = destination.with_name(destination.stem + "_" + digest[:12] + destination.suffix)
-        counter = 2
-        while True:
-            try:
-                os.link(temporary, target)
-                break
-            except FileExistsError:
-                if target.is_file() and not target.is_symlink() and sha256(target) == digest:
+            if size is not None and received != size:
+                raise MoodleError("ファイルサイズが一致しないため保存を中止しました。")
+            if not directory.is_current():
+                raise MoodleError("保存先が変更されたため中止しました。")
+            digest = digest.hexdigest()
+            target = destination
+            counter = 1
+            while True:
+                try:
+                    directory.link(temporary, target.name)
                     break
-                target = destination.with_name(destination.stem + f"_{digest[:12]}_{counter}" + destination.suffix)
-                counter += 1
-        return {**stamp, "sha256": digest, "path": str(target)}, "saved"
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+                except FileExistsError:
+                    try:
+                        with directory.open_read(target.name) as existing:
+                            if stream_digest(existing) == digest:
+                                break
+                    except (OSError, MoodleError):
+                        pass
+                    suffix = "" if counter == 1 else f"_{counter}"
+                    target = destination.with_name(destination.stem + f"_{digest[:12]}{suffix}" + destination.suffix)
+                    counter += 1
+                    if counter > 1000:
+                        raise MoodleError("同名ファイルが多すぎるため保存を中止しました。")
+            return {**stamp, "sha256": digest, "path": str(target)}, "saved"
 
 
 def run(args):
@@ -397,13 +479,19 @@ def run(args):
     manifest = {}
     if manifest_path.exists():
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            with Directory(root) as directory, directory.open_read(manifest_path.name) as stream:
+                raw = stream.read(8 * 1024 * 1024 + 1)
+            if len(raw) > 8 * 1024 * 1024:
+                raise ValueError
+            manifest = json.loads(raw)
             if not isinstance(manifest, dict):
                 raise ValueError
         except (ValueError, UnicodeError):
             raise MoodleError("取得履歴が壊れています。.manifest.jsonを別名に退避して再実行してください。") from None
     counts = {"saved": 0, "skip": 0, "failed": 0, "preview": 0}
+    budget = TransferBudget()
     for course in selected:
+        budget.check()
         sections = client.call("core_course_get_contents", courseid=course["id"])
         files = list(material_files(course, sections))
         print(f'\n{clean_name(course["fullname"])}: 取得可能な資料 {len(files)}件')
@@ -414,6 +502,8 @@ def run(args):
                 continue
             key = str(relative)
             previous = manifest.get(key)
+            if previous is not None and not isinstance(previous, dict):
+                raise MoodleError("取得履歴の項目が正しくありません。")
             destination = root / relative
             # 手動改変された履歴やシンボリックリンクで保存先の外に出ない。
             paths = [destination]
@@ -422,7 +512,7 @@ def run(args):
             if any(not p.resolve().is_relative_to(root) for p in paths):
                 raise MoodleError("保存先の外を指すパスがあるため中止しました。")
             try:
-                entry, status = download(client, item, destination, previous)
+                entry, status = download(client, item, destination, previous, budget=budget)
                 manifest[key] = entry
                 write_json(manifest_path, manifest)
                 counts[status] += 1
@@ -431,6 +521,9 @@ def run(args):
                 counts["failed"] += 1
                 message = str(exc) if isinstance(exc, MoodleError) else "ファイルの保存・通信に失敗しました。"
                 print("  [失敗]", clean_name(item["filename"]), message)
+                budget.check()
+                if budget.received >= MAX_TOTAL_BYTES:
+                    raise MoodleError("受信合計が2 GiBの上限に達したため中止しました。")
     print(f'\n完了: 保存 {counts["saved"]}件 / 取得済み {counts["skip"]}件 / 失敗 {counts["failed"]}件 / 取得予定 {counts["preview"]}件')
     if not args.dry_run:
         print("保存先:", root)

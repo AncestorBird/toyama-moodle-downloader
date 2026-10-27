@@ -32,6 +32,10 @@ Pythonの導入は不要です。公開されたページを開き、Moodleの�
 
 認証情報とAPIリクエストは、ブラウザから `https://moodle52.u-toyama.ac.jp/` へHTTPSで直接送ります。認証用サーバーや外部の通信中継サービスは追加しません。資料のZIPもブラウザ内で作成します。認証情報・APIトークンをURLに含めず、別URLへの転送は拒否します。
 
+他サイトのフレーム内では、ログイン欄を生成せず、認証処理も起動しません。ただし、GitHub Pages単体では `frame-ancestors` / `X-Frame-Options` のHTTPヘッダーを設定できません。ブラウザ自体にページ全体の埋め込みを拒否させるには、これらのヘッダーを返せる配信環境が必要です。
+
+保存パスワードの境界はドメイン（オリジン）単位です。同じ `ancestorbird.github.io` にある他のプロジェクトとは、パスワード保存の境界を分離できません。より厳密に分離する場合は専用ドメインを使用してください。
+
 GitHub Pagesはページ自体の配信に使われるため、通常のページアクセス情報はGitHubにも送られます。アプリに外部のアクセス解析はありません。ブラウザのパスワード同期や拡張機能は、それぞれの利用者の設定に従います。
 
 Web版はMoodle側のCORS許可に依存します。ログイン・REST API・ファイル取得の各エンドポイントが、認証なしの応答で `Access-Control-Allow-Origin: *` を返すことを確認済みです。実アカウントでのログイン・資料取得は未検証です。Moodle側の設定変更や追加認証によっては利用できません。
@@ -44,7 +48,7 @@ Web版はMoodle側のCORS許可に依存します。ログイン・REST API・�
 2. この変更を `main` に反映します。`.github/workflows/pages.yml` がテスト・ビルド後に公開します。Actionsの **Test and publish GitHub Pages → Run workflow** からも実行できます。
 3. Actionsの `deploy` ジョブが成功したら、その出力・環境画面に表示されるURLを開いて確認します。
 
-標準のプロジェクトURLは `https://ancestorbird.github.io/toyama-moodle-downloader/` です。これは公開後の想定URLであり、このREADMEの追加だけでは公開されません。独自ドメイン・フォークでは、GitHub Pagesの設定に表示されるURLを使用してください。
+標準のプロジェクトURLは `https://ancestorbird.github.io/toyama-moodle-downloader/` です。公開はActionsのdeployジョブで行います。独自ドメイン・フォークでは、GitHub Pagesの設定に表示されるURLを使用してください。
 
 APIキーやMoodleの認証情報をGitHub Secretsに登録する必要はありません。利用者が公開ページから各自のアカウントでログインします。依存パッケージはページと一緒にビルドされ、閲覧時に外部CDNから読み込む構成にはしていません。
 
@@ -164,7 +168,9 @@ python tools/moodle_download.py --course 123
 python tools/moodle_download.py --course 123 --course 456
 ```
 
-保存先を変える場合は `--output /path/to/folder` を指定できます。独自の保存先はこのリポジトリの `.gitignore` では保護されない場合があるため、共有するコードとは別の場所を指定してください。
+CLIの上限は1ファイル250 MiB、1回の受信合計2 GiBです。宣言サイズを超える応答は受信中に中止し、失敗したファイルの受信量も合計へ加算します。1ファイル120秒・取得処理全体30分を過ぎると中止を判定します（通信待ちの間は、ソケットのタイムアウト分だけ判定が遅れる場合があります）。授業を分けて取得してください。
+
+保存先を変える場合は `--output /path/to/folder` を指定できます。独自の保存先はこのリポジトリの `.gitignore` では保護されない場合があるため、共有するコードとは別の場所を指定してください。他の利用者が変更できる共有フォルダは避けてください。保存先配下のシンボリックリンク・Windowsのジャンクションは受け付けません。
 
 ## 情報の扱い
 

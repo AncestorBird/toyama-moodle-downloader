@@ -162,9 +162,9 @@ export async function login(username, password, options) {
   const client = new MoodleClient(result.token);
   try {
     const info = await client.call('core_webservice_get_site_info', {}, options);
-    if (!Number.isInteger(info.userid)) throw new MoodleError('利用者情報を取得できませんでした。');
+    if (!Number.isSafeInteger(info?.userid) || info.userid <= 0) throw new MoodleError('利用者情報を取得できませんでした。');
     const courses = await client.call('core_enrol_get_users_courses', { userid: info.userid }, options);
-    if (!Array.isArray(courses) || courses.some(c => !Number.isInteger(c.id) || typeof c.fullname !== 'string')) {
+    if (!Array.isArray(courses) || courses.some(c => !Number.isSafeInteger(c?.id) || c.id <= 0 || typeof c.fullname !== 'string')) {
       throw new MoodleError('授業一覧を取得できませんでした。');
     }
     courses.sort((a, b) => (b.startdate || 0) - (a.startdate || 0) || b.id - a.id);

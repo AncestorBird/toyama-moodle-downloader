@@ -5,6 +5,8 @@ from contextlib import redirect_stdout
 from email.message import Message
 import io
 import json
+import os
+import subprocess
 from pathlib import Path
 import tempfile
 import types
@@ -77,7 +79,7 @@ class DownloadTests(unittest.TestCase):
 
     def test_download_skip_update_and_preserve_local_changes(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve()
             self.assertEqual(self.run_tool(root), 0)
             original = next(root.rglob("*.pdf"))
             original_bytes = original.read_bytes()
@@ -100,7 +102,7 @@ class DownloadTests(unittest.TestCase):
 
     def test_preview_does_not_write_files(self):
         with tempfile.TemporaryDirectory() as folder:
-            output = Path(folder) / "new"
+            output = Path(folder).resolve() / "new"
             self.assertEqual(self.run_tool(output, dry_run=True), 0)
             self.assertFalse(output.exists())
             self.assertEqual(FakeClient.reads, 0)
@@ -112,10 +114,10 @@ class DownloadTests(unittest.TestCase):
             with self.subTest(media_type=media_type), tempfile.TemporaryDirectory() as folder:
                 client = FakeClient()
                 client.file_response = lambda url: Response(body, media_type)
-                destination = Path(folder) / "file.pdf"
+                destination = Path(folder).resolve() / "file.pdf"
                 with self.assertRaises(moodle.MoodleError):
                     moodle.download(client, {"fileurl": "unused", "filesize": 500}, destination, None)
-                self.assertEqual(list(Path(folder).iterdir()), [])
+                self.assertEqual(list(Path(folder).resolve().iterdir()), [])
 
     def test_credentials_only_in_post_and_no_external_destinations(self):
         client = moodle.Client()
@@ -152,15 +154,213 @@ class DownloadTests(unittest.TestCase):
 
     def test_manifest_cannot_direct_download_outside_output(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder) / "downloads"
+            root = Path(folder).resolve() / "downloads"
             self.run_tool(root)
             manifest_path = root / ".manifest.json"
             manifest = json.loads(manifest_path.read_text())
-            next(iter(manifest.values()))["path"] = str(Path(folder) / "outside.pdf")
+            next(iter(manifest.values()))["path"] = str(Path(folder).resolve() / "outside.pdf")
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaises(moodle.MoodleError):
                 self.run_tool(root)
-            self.assertFalse((Path(folder) / "outside.pdf").exists())
+            self.assertFalse((Path(folder).resolve() / "outside.pdf").exists())
+
+
+class SecurityTests(unittest.TestCase):
+    def item(self, **extra):
+        return {"fileurl": "mock-only", **extra}
+
+    def client(self, data):
+        return Mock(file_response=Mock(return_value=Response(data)))
+
+    def symlink(self, path, target, directory=False):
+        try:
+            path.symlink_to(target, target_is_directory=directory)
+        except OSError:
+            self.skipTest("Symlinks unavailable for this account")
+
+    def test_reserved_api_keys_cannot_override_read_function_or_token(self):
+        client = moodle.Client()
+        client.token = "dummy"
+        for key in ("wsfunction", "wstoken", "moodlewsrestformat"):
+            with patch.object(client, "json") as request:
+                with self.assertRaises(moodle.MoodleError):
+                    client.call("core_course_get_contents", **{key: "override"})
+                request.assert_not_called()
+
+    def test_malformed_ids_cannot_create_traversal_paths(self):
+        for value in ("../../outside", "1", -1, 0, 1.5, True, 2**53):
+            for field in ("course", "section", "module"):
+                course = {"id": value if field == "course" else 1, "fullname": "course"}
+                module = {"id": value if field == "module" else 3, "contents": []}
+                sections = [{"id": value if field == "section" else 2, "modules": [module]}]
+                with self.assertRaises(moodle.MoodleError):
+                    list(moodle.material_files(course, sections))
+
+    def test_oversized_declared_files_are_rejected_without_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            client = self.client(b"unused")
+            with self.assertRaises(moodle.MoodleError):
+                moodle.download(client, self.item(filesize=moodle.MAX_FILE_BYTES + 1), Path(folder).resolve() / "file", None)
+            client.file_response.assert_not_called()
+            self.assertEqual(list(Path(folder).resolve().iterdir()), [])
+
+    def test_streams_stop_at_declared_or_hard_limit_and_cleanup(self):
+        for declared in (None, 1):
+            with self.subTest(declared=declared), tempfile.TemporaryDirectory() as folder:
+                response = Response(b"x" * 4096)
+                client = Mock(file_response=Mock(return_value=response))
+                budget = moodle.TransferBudget()
+                with patch.object(moodle, "MAX_FILE_BYTES", 32):
+                    with self.assertRaises(moodle.MoodleError):
+                        moodle.download(client, self.item(filesize=declared), Path(folder).resolve() / "file", None, budget=budget)
+                self.assertEqual(budget.received, (declared if declared is not None else 32) + 1)
+                self.assertTrue(response.closed)
+                self.assertEqual(list(Path(folder).resolve().iterdir()), [])
+
+    def test_exact_capacity_and_empty_files_can_be_saved(self):
+        for body in (b"", b"x" * 32):
+            with tempfile.TemporaryDirectory() as folder, patch.object(moodle, "MAX_FILE_BYTES", 32):
+                target = Path(folder).resolve() / "file"
+                entry, status = moodle.download(self.client(body), self.item(filesize=len(body)), target, None)
+                self.assertEqual(status, "saved")
+                self.assertEqual(target.read_bytes(), body)
+                self.assertEqual(entry["sha256"], moodle.sha256(target))
+
+    def test_fragmented_api_error_is_never_saved(self):
+        class Fragmented(Response):
+            def read1(self, size):
+                return super().read1(min(size, 1))
+        body = b'{"errorcode":"invalidtoken","message":"dummy"}'
+        with tempfile.TemporaryDirectory() as folder:
+            client = Mock(file_response=Mock(return_value=Fragmented(body)))
+            with self.assertRaises(moodle.MoodleError):
+                moodle.download(client, self.item(filesize=len(body)), Path(folder).resolve() / "file", None)
+            self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_oversized_content_length_is_rejected_before_read(self):
+        with tempfile.TemporaryDirectory() as folder:
+            response = Response(b"unused")
+            response.headers["Content-Length"] = "10000"
+            with patch.object(response, "read1", side_effect=AssertionError("must not read")):
+                with self.assertRaises(moodle.MoodleError):
+                    moodle.download(Mock(file_response=Mock(return_value=response)), self.item(filesize=1), Path(folder).resolve() / "file", None)
+            self.assertEqual(list(Path(folder).resolve().iterdir()), [])
+
+    def test_total_budget_includes_failed_files_and_stops_next_request(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(moodle, "MAX_TOTAL_BYTES", 10):
+            root = Path(folder).resolve()
+            budget = moodle.TransferBudget()
+            with self.assertRaises(moodle.MoodleError):
+                moodle.download(self.client(b"123456"), self.item(filesize=8), root / "bad", None, budget=budget)
+            self.assertEqual(budget.received, 6)
+            client = self.client(b"12345")
+            with self.assertRaises(moodle.MoodleError):
+                moodle.download(client, self.item(filesize=5), root / "next", None, budget=budget)
+            client.file_response.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_trickling_response_cannot_reset_file_deadline(self):
+        clock = [0]
+        class Trickling(Response):
+            def read1(self, size):
+                clock[0] += 50
+                return super().read1(min(size, 1))
+        with tempfile.TemporaryDirectory() as folder, patch.object(moodle.time, "monotonic", side_effect=lambda: clock[0]):
+            response = Trickling(b"123456789")
+            with self.assertRaisesRegex(moodle.MoodleError, "制限時間"):
+                moodle.download(Mock(file_response=Mock(return_value=response)), self.item(), Path(folder).resolve() / "file", None)
+            self.assertEqual(clock[0], 150)
+            self.assertEqual(list(Path(folder).resolve().iterdir()), [])
+
+    def test_expired_total_budget_sends_nothing(self):
+        budget = moodle.TransferBudget()
+        budget.deadline = 0
+        client = self.client(b"unused")
+        with self.assertRaises(moodle.MoodleError):
+            moodle.download(client, self.item(), Path("unused"), None, budget=budget)
+        client.file_response.assert_not_called()
+
+    def test_api_trickling_is_bounded_too(self):
+        clock = [0]
+        class Trickling(Response):
+            def read1(self, size):
+                clock[0] += 25
+                return b" "
+        client = moodle.Client()
+        with (patch.object(client, "open", return_value=Trickling(b"")),
+              patch.object(moodle.time, "monotonic", side_effect=lambda: clock[0])):
+            with self.assertRaisesRegex(moodle.MoodleError, "制限時間"):
+                client.json(moodle.SITE, {})
+        self.assertEqual(clock[0], 50)
+
+    def test_parent_swap_during_response_never_writes_outside(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            parent, outside = root / "downloads", root / "outside"
+            parent.mkdir()
+            outside.mkdir()
+            if os.name != "nt":
+                self.symlink(root / "probe", outside, True)
+                (root / "probe").unlink()
+            swapped = []
+            def response(url):
+                try:
+                    parent.rename(root / "original")
+                except PermissionError:
+                    # Windows must pin the path by denying directory renames.
+                    swapped.append(False)
+                    return Response(b"123")
+                swapped.append(True)
+                parent.symlink_to(outside, target_is_directory=True)
+                return Response(b"123")
+            client = Mock(file_response=Mock(side_effect=response))
+            if os.name == "nt":
+                moodle.download(client, self.item(filesize=3), parent / "file", None)
+                self.assertEqual(swapped, [False])
+                self.assertEqual((parent / "file").read_bytes(), b"123")
+            else:
+                with self.assertRaises(moodle.MoodleError):
+                    moodle.download(client, self.item(filesize=3), parent / "file", None)
+                self.assertEqual(swapped, [True])
+                self.assertEqual(list((root / "original").iterdir()), [])
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_static_symlink_parent_and_history_are_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            outside = root / "outside"
+            outside.mkdir()
+            linked = root / "linked"
+            self.symlink(linked, outside, True)
+            with self.assertRaises(OSError):
+                moodle.download(self.client(b"123"), self.item(filesize=3), linked / "file", None)
+            secret = outside / "secret"
+            secret.write_bytes(b"unchanged")
+            history = root / ".manifest.json"
+            self.symlink(history, secret)
+            with moodle.Directory(root) as directory:
+                with self.assertRaises(OSError):
+                    directory.open_read(history.name)
+            moodle.write_json(history, {"safe": True})
+            self.assertEqual(secret.read_bytes(), b"unchanged")
+            self.assertFalse(history.is_symlink())
+            self.assertEqual(json.loads(history.read_text()), {"safe": True})
+
+    @unittest.skipUnless(os.name == "nt", "Windows junctions only")
+    def test_windows_junction_parent_is_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            outside, linked = root / "outside", root / "junction"
+            outside.mkdir()
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(linked), str(outside)], check=True, capture_output=True)
+            with self.assertRaises(OSError):
+                moodle.download(self.client(b"123"), self.item(filesize=3), linked / "file", None)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_long_names_preserve_unicode_with_bounded_work(self):
+        name = moodle.clean_name("あ😀" * 100000)
+        self.assertLessEqual(len(name.encode("utf-8")), 160)
+        self.assertEqual(name, "あ😀" * 22 + "あ")
 
 
 class MemoryBackend:

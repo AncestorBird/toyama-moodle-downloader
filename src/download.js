@@ -4,12 +4,22 @@ import { CancelledError, fileURL, MAX_FILE_BYTES, MoodleError } from './api.js';
 export const MAX_ARCHIVE_BYTES = 200 * 1024 * 1024;
 
 export function cleanName(value) {
-  let text = String(value).replace(/<[^>]*>/g, '').replace(/&(?:amp|lt|gt|quot|apos|#39|nbsp);/g,
+  let text = String(value).replace(/<[^<>]*>/g, '').replace(/&(?:amp|lt|gt|quot|apos|#39|nbsp);/g,
     entity => ({ '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&#39;': "'", '&nbsp;': ' ' })[entity]);
-  text = text.replace(/[\x00-\x1f\x7f/\\:*?"<>|]/g, '_').replace(/^[ .]+|[ .]+$/g, '');
-  const chars = Array.from(text);
-  while (new TextEncoder().encode(chars.join('')).length > 160) chars.pop();
-  return chars.join('') || '名称なし';
+  text = text.replace(/[\x00-\x1f\x7f/\\:*?"<>|]/g, '_').replace(/^[ .]+/, '');
+  const { read } = new TextEncoder().encodeInto(text, new Uint8Array(160));
+  return text.slice(0, read).replace(/[ .]+$/g, '') || '名称なし';
+}
+
+function requireID(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new MoodleError('資料のIDが正しくありません。');
+}
+
+export function validateArchivePath(path) {
+  if (typeof path !== 'string' || /[\\:*?"<>|\x00-\x1f\x7f]/.test(path)
+      || path.split('/').some(part => !part || /[ .]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) {
+    throw new MoodleError('ZIPの保存パスが正しくありません。');
+  }
 }
 
 export function formatBytes(bytes) {
@@ -20,11 +30,16 @@ export async function collectMaterials(client, courses, { signal, onCourse = () 
   const materials = new Map();
   for (const course of courses) {
     if (signal?.aborted) throw new CancelledError();
+    requireID(course.id);
     onCourse(course);
     const sections = await client.call('core_course_get_contents', { courseid: course.id }, { signal });
     if (!Array.isArray(sections)) throw new MoodleError('授業の内容を取得できませんでした。');
     for (const section of sections) {
+      requireID(section?.id);
+      if (section.modules != null && !Array.isArray(section.modules)) throw new MoodleError('授業の内容が正しくありません。');
       for (const module of section.modules || []) {
+        requireID(module?.id);
+        if (module.contents != null && !Array.isArray(module.contents)) throw new MoodleError('資料の内容が正しくありません。');
         if (module.uservisible === false) continue;
         for (const item of module.contents || []) {
           if (item.type !== 'file' || !item.fileurl || !item.filename) continue;
@@ -34,6 +49,7 @@ export async function collectMaterials(client, courses, { signal, onCourse = () 
           const key = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
           const path = `${course.id}_${cleanName(course.fullname)}/${section.id}_${cleanName(section.name || '資料')}`
             + `/${module.id}_${cleanName(module.name)}/${key}_${cleanName(item.filename)}`;
+          validateArchivePath(path);
           materials.set(path, { item, path, name: cleanName(item.filename), course: cleanName(course.fullname) });
         }
       }
@@ -43,6 +59,7 @@ export async function collectMaterials(client, courses, { signal, onCourse = () 
 }
 
 export async function createArchive(client, materials, { signal, onProgress = () => {} } = {}) {
+  for (const material of materials) validateArchivePath(material.path);
   const declaredTotal = materials.reduce((sum, { item }) => sum + Math.max(0, Number(item.filesize) || 0), 0);
   if (declaredTotal > MAX_ARCHIVE_BYTES) throw new MoodleError('合計が200 MBを超えています。選ぶ授業を減らして取得してください。');
   const files = Object.create(null);

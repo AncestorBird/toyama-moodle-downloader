@@ -64,3 +64,28 @@ test('empty material lists do not create empty ZIPs', async () => {
   assert.equal(result.blob, null);
   assert.equal(result.saved, 0);
 });
+
+test('untrusted IDs cannot become ZIP directory components', async () => {
+  for (const bad of ['../../../../outside', '1', 0, -1, 1.5, null, Number.MAX_SAFE_INTEGER + 1]) {
+    for (const field of ['course', 'section', 'module']) {
+      const course = { id: field === 'course' ? bad : 1, fullname: '授業' };
+      const module = { id: field === 'module' ? bad : 3, name: '資料', contents: [item] };
+      const section = { id: field === 'section' ? bad : 2, modules: [module] };
+      await assert.rejects(collectMaterials({ call: async () => [section] }, [course]), MoodleError);
+    }
+  }
+});
+
+test('unsafe archive paths are rejected before any download', async () => {
+  for (const path of ['../outside', '/absolute', 'a/../b', 'a/./b', 'a//b', 'a\\b', 'C:evil', 'a\x00b', 'a/.. /b', 'a/nul.txt', 'a/file.']) {
+    let calls = 0;
+    await assert.rejects(createArchive({ file: async () => { calls++; } }, [{ ...materials[0], path }]), MoodleError);
+    assert.equal(calls, 0);
+  }
+});
+
+test('very long names truncate without splitting UTF-8 characters', { timeout: 2000 }, () => {
+  assert.equal(cleanName('あ😀'.repeat(100000)), 'あ😀'.repeat(22) + 'あ');
+  assert.equal(cleanName('<'.repeat(100000)), '_'.repeat(160));
+  assert.equal(cleanName('a' + ' '.repeat(100000) + 'b'), 'a');
+});

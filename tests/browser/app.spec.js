@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { unzipSync } from 'fflate';
 
 const SITE = 'https://moodle52.u-toyama.ac.jp';
@@ -170,4 +171,40 @@ test('mobile layout has no horizontal overflow and password can be shown and hid
   await page.getByRole('button', { name: 'パスワードを隠す' }).click();
   await expect(page.locator('#password')).toHaveAttribute('type', 'password');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+for (const sandbox of [null, 'allow-scripts', 'allow-scripts allow-same-origin', '']) {
+  test(`embedded pages never expose credential fields (sandbox=${sandbox})`, async ({ page }) => {
+    const requests = await mockMoodle(page);
+    const attribute = sandbox === null ? '' : `sandbox="${sandbox}"`;
+    const parent = createServer((req, res) => {
+      res.setHeader('Content-Type', 'text/html');
+      res.end(`<iframe ${attribute} src="http://127.0.0.1:4173/toyama-moodle-downloader/"></iframe>`);
+    });
+    await new Promise(resolve => parent.listen(0, '127.0.0.1', resolve));
+    // Match GitHub Pages' public CORS headers for opaque sandbox origins.
+    await page.route('http://127.0.0.1:4173/**', async route => {
+      const response = await route.fetch();
+      await route.fulfill({ response, headers: { ...response.headers(), 'access-control-allow-origin': '*' } });
+    });
+    try {
+      await page.goto(`http://127.0.0.1:${parent.address().port}/frame-test`);
+      const frame = page.frameLocator('iframe');
+      await expect(frame.locator('#login-template')).toHaveCount(1);
+      if (sandbox !== '') await expect(frame.locator('#launch-message')).toContainText('埋め込み画面ではログインできません');
+      await expect(frame.locator('input[name="username"], input[name="password"]')).toHaveCount(0);
+      await expect(frame.locator('#login-form')).toHaveCount(0);
+      expect(requests).toHaveLength(0);
+    } finally { await new Promise(resolve => parent.close(resolve)); }
+  });
+}
+
+test('credential inputs remain inert when JavaScript is unavailable', async ({ browser, baseURL }) => {
+  const context = await browser.newContext({ javaScriptEnabled: false });
+  try {
+    const page = await context.newPage();
+    await page.goto(baseURL);
+    await expect(page.locator('#login-template')).toHaveCount(1);
+    await expect(page.locator('input[name="username"], input[name="password"]')).toHaveCount(0);
+  } finally { await context.close(); }
 });

@@ -9,7 +9,7 @@
     <title>Moodle資料取得 | 富山大学</title>
     <link rel="icon" href="./cloud-icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="./src/styles.css">
-    <script type="module" src="./src/main.js"></script>
+    <script type="module" src="./src/bootstrap.js"></script>
   </head>
   <body>
     <header class="site-header">
@@ -31,6 +31,9 @@
         <aside class="account-column">
           <section class="card account-card" aria-labelledby="account-heading">
             <div class="section-heading"><span class="step">01</span><h2 id="account-heading">Moodleにログイン</h2></div>
+            <p id="launch-message">ログイン画面を準備しています…</p>
+            <div id="login-container"></div>
+            <template id="login-template">
             <form id="login-form" method="post" autocomplete="on">
               <label class="field-label" for="username">ユーザー名</label>
               <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required placeholder="Moodleのユーザー名">
@@ -42,6 +45,7 @@
               <label class="checkbox-label remember-option" id="remember-option" hidden><input id="remember" type="checkbox">このブラウザにパスワードを保存</label>
               <button id="login-button" type="submit" class="button primary full-width" disabled>ログイン <span aria-hidden="true">→</span></button>
             </form>
+            </template>
             <div id="session-box" hidden>
               <div class="account-profile"><span class="avatar" aria-hidden="true">✓</span><div><strong id="account-name"></strong><span class="connected-label">Moodleに接続中</span></div></div>
               <button id="logout-button" type="button" class="button secondary full-width">ログアウト</button>
