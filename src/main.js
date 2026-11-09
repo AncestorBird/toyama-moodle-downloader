@@ -1,26 +1,42 @@
 import { CancelledError, login, MoodleError } from './api.js';
 import { cleanName, collectMaterials, createArchive, formatBytes } from './download.js';
 import { assignmentText, collectAssignments, formatDeadline } from './assignments.js';
+import { courseMetadata, courseYears, defaultCourseScope, filterCourses } from './courses.js';
 
 const $ = id => document.getElementById(id);
 let session = null;
 let operation = null;
+let operationKind = null;
+let mode = 'assignments';
 let archiveURL = null;
 let assignmentResults = null;
+let assignmentCourses = [];
+let assignmentState = 'idle';
+let autoTimer = null;
 const selected = new Set();
+const pending = item => ['new', 'draft', 'reopened'].includes(item.status);
 
 function status(message, error = false) {
   $('status').textContent = message;
   $('status').classList.toggle('error', error);
 }
 
-function busy(active) {
+function scope() {
+  return { year: $('year-filter').value, quarter: $('quarter-filter').value, query: $('course-search').value };
+}
+function visibleCourses() { return filterCourses(session?.courses || [], scope()); }
+
+function busy(active = !!operation) {
+  const blocking = !!operation && operationKind !== 'assignments';
   $('login-button').disabled = active;
   for (const id of ['username', 'password', 'show-password', 'remember']) $(id).disabled = active;
-  for (const id of ['logout-button', 'course-search', 'select-all', 'preview']) $(id).disabled = active || !session;
-  $('download-button').disabled = active || !session || !selected.size;
-  $('assignment-button').disabled = active || !session || !selected.size;
-  $('assignment-filter').disabled = active;
+  $('logout-button').disabled = !session || blocking;
+  for (const id of ['mode-assignments', 'mode-materials']) $(id).disabled = blocking;
+  for (const id of ['year-filter', 'quarter-filter', 'course-search']) $(id).disabled = !session || blocking;
+  for (const id of ['select-all', 'preview']) $(id).disabled = active || !session;
+  $('download-button').disabled = active || !session || mode !== 'materials' || !selected.size;
+  $('assignment-button').disabled = active || !session || !visibleCourses().length;
+  $('assignment-filter').disabled = !session;
   for (const input of $('course-list').querySelectorAll('input')) input.disabled = active;
   $('cancel-button').hidden = !active;
   $('cancel-button').disabled = !active;
@@ -37,153 +53,249 @@ function clearArchive() {
   $('archive-link').removeAttribute('href');
 }
 
-function clearAssignments() {
+function stopAssignmentCheck() {
+  clearTimeout(autoTimer);
+  autoTimer = null;
+  if (operationKind === 'assignments') {
+    operation.abort();
+    operation = null;
+    operationKind = null;
+  }
+}
+
+function resetAssignments(state = 'idle') {
   assignmentResults = null;
-  $('assignment-panel').hidden = true;
-  $('assignment-list').replaceChildren();
+  assignmentCourses = session ? visibleCourses() : [];
+  assignmentState = state;
   $('assignment-warnings').replaceChildren();
-  $('assignment-summary').textContent = '';
-  $('assignment-filter').value = 'all';
+  renderAssignments();
+}
+
+function node(tag, text, className = '') {
+  const element = document.createElement(tag);
+  element.textContent = text;
+  element.className = className;
+  return element;
+}
+
+function assignmentRow(item) {
+  const row = document.createElement('article');
+  row.className = 'assignment-row';
+  const title = document.createElement('h3');
+  const link = node('a', assignmentText(item.name) || '名称なし');
+  link.href = item.url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  title.append(link);
+  const meta = document.createElement('div');
+  meta.className = 'assignment-meta';
+  meta.append(node('span', item.statusLabel, `assignment-state ${item.status}`),
+    node('span', `締切: ${formatDeadline(item.dueDate)}${item.extended ? '（個別延長）' : ''}`));
+  row.append(title, meta);
+  for (const message of [item.warning, item.error].filter(Boolean)) row.append(node('p', message, 'assignment-warning'));
+  const details = document.createElement('details');
+  details.append(node('summary', '課題の説明・提出ファイル'));
+  details.append(node('p', assignmentText(item.description) || '説明文はありません。課題名のリンクからMoodleを確認してください。', 'assignment-description'));
+  if (item.instructions && item.instructions !== item.description) {
+    details.append(node('p', `課題の指示\n${assignmentText(item.instructions)}`, 'assignment-description'));
+  }
+  details.append(node('p', item.files.length ? `登録ファイル: ${item.files.join('、')}`
+    : '登録ファイルは取得されませんでした。オンラインテキストや紙での提出は授業の指示を確認してください。', 'assignment-description'));
+  row.append(details);
+  return row;
 }
 
 function renderAssignments() {
-  if (!assignmentResults) return;
-  const { items, warnings, checkedAt } = assignmentResults;
-  const submitted = items.filter(item => item.status === 'submitted').length;
+  const items = assignmentResults?.items || [];
   const unknown = items.filter(item => item.status === 'unknown').length;
-  const pending = items.length - submitted - unknown;
-  $('assignment-summary').textContent = `${formatDeadline(Math.floor(checkedAt / 1000))} に確認 · ${items.length}件中、提出済み ${submitted}件 / 未提出等 ${pending}件 / 確認できず ${unknown}件`;
-  const warningNodes = warnings.map(message => {
-    const node = document.createElement('p');
-    node.textContent = message;
-    return node;
-  });
-  $('assignment-warnings').replaceChildren(...warningNodes);
-  const filter = $('assignment-filter').value;
-  const shown = items.filter(item => filter === 'all' || (filter === 'pending'
-    ? ['new', 'draft', 'reopened'].includes(item.status) : item.status === filter));
+  const open = items.filter(pending).length;
+  const done = items.filter(item => item.status === 'submitted').length;
+  $('assignment-summary').textContent = assignmentResults
+    ? `${assignmentCourses.length}授業 · 未提出等 ${open}件 / 要確認 ${unknown}件 / 提出済み ${done}件 · ${formatDeadline(Math.floor(assignmentResults.checkedAt / 1000))} 更新`
+    : assignmentState === 'loading' ? `${assignmentCourses.length}授業の提出状況を確認しています…`
+      : session ? 'この範囲の提出状況はまだ確認できていません。' : 'ログインすると、対象の授業を自動で確認します。';
+  $('assignment-warnings').replaceChildren(...(assignmentResults?.warnings || []).map(message => node('p', message)));
   const fragment = document.createDocumentFragment();
-  for (const item of shown) {
-    const row = document.createElement('article');
-    row.className = 'assignment-row';
-    const course = document.createElement('p');
-    course.className = 'assignment-course';
-    course.textContent = assignmentText(item.course);
-    const title = document.createElement('h3');
-    const link = document.createElement('a');
-    link.href = item.url;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.textContent = assignmentText(item.name) || '名称なし';
-    title.append(link);
-    const meta = document.createElement('div');
-    meta.className = 'assignment-meta';
-    const state = document.createElement('span');
-    state.className = `assignment-state ${item.status}`;
-    state.textContent = item.statusLabel;
-    const due = document.createElement('span');
-    due.textContent = `締切: ${formatDeadline(item.dueDate)}${item.extended ? '（個別延長）' : ''}`;
-    meta.append(state, due);
-    row.append(course, title, meta);
-    for (const message of [item.warning, item.error].filter(Boolean)) {
-      const warning = document.createElement('p');
-      warning.className = 'assignment-warning';
-      warning.textContent = message;
-      row.append(warning);
-    }
-    const details = document.createElement('details');
+  const filter = $('assignment-filter').value;
+  for (const course of assignmentCourses) {
+    const metadata = courseMetadata(course);
+    const courseItems = items.filter(item => item.courseId === course.id);
+    const coursePending = courseItems.filter(pending);
+    const courseUnknown = courseItems.filter(item => item.status === 'unknown');
+    const shown = courseItems.filter(item => filter === 'all' || (filter === 'pending'
+      ? pending(item) || item.status === 'unknown' : item.status === filter));
+    const group = document.createElement('details');
+    group.className = 'assignment-course-group';
+    group.dataset.courseId = course.id;
+    group.open = !!assignmentResults && (coursePending.length > 0 || courseUnknown.length > 0 || filter !== 'pending');
     const summary = document.createElement('summary');
-    summary.textContent = '課題の説明・提出ファイル';
-    const description = document.createElement('p');
-    description.className = 'assignment-description';
-    description.textContent = assignmentText(item.description) || '説明文はありません。詳しくは課題名のリンクからMoodleを確認してください。';
-    details.append(summary, description);
-    if (item.instructions && item.instructions !== item.description) {
-      const instructions = document.createElement('p');
-      instructions.className = 'assignment-description';
-      instructions.textContent = `課題の指示\n${assignmentText(item.instructions)}`;
-      details.append(instructions);
-    }
-    const files = document.createElement('p');
-    files.className = 'assignment-description';
-    files.textContent = item.files.length ? `登録ファイル: ${item.files.join('、')}`
-      : '登録ファイルは取得されませんでした。オンラインテキストや紙での提出状況はMoodle・授業の指示を確認してください。';
-    details.append(files);
-    row.append(details);
-    fragment.append(row);
+    const heading = document.createElement('span');
+    heading.append(node('strong', metadata.title, 'course-group-title'), node('span', metadata.termLabel, 'course-group-term'));
+    const counts = !assignmentResults ? (assignmentState === 'loading' ? '確認中' : '未確認')
+      : courseItems.length ? `未提出等 ${coursePending.length} · 要確認 ${courseUnknown.length} · 提出済み ${courseItems.filter(item => item.status === 'submitted').length}`
+        : '取得できる課題なし';
+    summary.append(heading, node('span', counts, 'course-group-counts'));
+    const deadlines = coursePending.filter(item => item.dueDate).map(item => item.dueDate).sort((a, b) => a - b);
+    const next = deadlines.find(value => value >= Date.now() / 1000) || deadlines[0];
+    if (next) summary.append(node('span', `締切 ${formatDeadline(next)}`, 'course-group-next'));
+    group.append(summary);
+    if (!assignmentResults) {
+      group.append(node('p', assignmentState === 'loading' ? '課題と提出状況を確認しています。'
+        : '確認が完了していません。「再確認」で取得できます。', 'no-results'));
+    } else if (!shown.length) {
+      group.append(node('p', courseItems.length ? 'この表示条件に合う課題はありません。表示を「すべて」にすると提出済みの課題も見られます。'
+        : '取得できる課題はありませんでした。非公開・閲覧制限のある課題や小テストは含みません。', 'no-results'));
+    } else for (const item of shown) group.append(assignmentRow(item));
+    const materials = node('button', 'この授業の資料を保存', 'text-button course-materials-button');
+    materials.type = 'button';
+    materials.addEventListener('click', () => {
+      changeMode('materials');
+      selected.clear();
+      selected.add(course.id);
+      renderCourses();
+      $('materials-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    group.append(materials);
+    fragment.append(group);
   }
-  if (!shown.length) {
-    const empty = document.createElement('p');
-    empty.className = 'no-results';
-    empty.textContent = items.length ? 'この表示条件に合う課題はありません。'
-      : '選択した授業から取得できる課題はありませんでした。非公開・閲覧制限のある課題や小テストは含まれません。';
-    fragment.append(empty);
+  if (!assignmentCourses.length) {
+    fragment.append(node('p', session ? 'この範囲に授業はありません。年度・クォーター・検索条件を変更してください。'
+      : 'ログイン後、年度とクォーターで対象を絞れます。未提出・要確認の課題から授業ごとに表示します。', 'no-results'));
   }
   $('assignment-list').replaceChildren(fragment);
-  $('assignment-panel').hidden = false;
-}
-
-function visibleCourses() {
-  const query = $('course-search').value.trim().toLocaleLowerCase();
-  return (session?.courses || []).filter(course =>
-    `${cleanName(course.fullname)} ${course.id}`.toLocaleLowerCase().includes(query));
 }
 
 function selection() {
   $('selected-count').textContent = selected.size;
-  $('download-button').disabled = !!operation || !selected.size;
-  $('assignment-button').disabled = !!operation || !selected.size;
   const shown = visibleCourses();
   $('select-all').textContent = shown.length && shown.every(course => selected.has(course.id))
     ? '表示中の選択を解除' : '表示中をすべて選択';
+  busy();
 }
 
 function renderCourses() {
   const fragment = document.createDocumentFragment();
   const courses = visibleCourses();
   for (const course of courses) {
+    const metadata = courseMetadata(course);
     const row = document.createElement('label');
     row.className = 'course-row';
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.value = course.id;
     checkbox.checked = selected.has(course.id);
-    checkbox.disabled = !!operation;
     checkbox.addEventListener('change', () => {
       if (checkbox.checked) selected.add(course.id); else selected.delete(course.id);
       selection();
     });
     const text = document.createElement('span');
     text.className = 'course-name';
-    const name = document.createElement('strong');
-    name.textContent = cleanName(course.fullname);
-    const id = document.createElement('span');
-    id.textContent = `授業ID ${course.id}`;
-    text.append(name, id);
+    text.append(node('strong', metadata.title), node('span', `${metadata.termLabel} · 授業ID ${course.id}`));
     row.append(checkbox, text);
     fragment.append(row);
   }
-  if (!courses.length) {
-    const empty = document.createElement('p');
-    empty.className = 'no-results';
-    empty.textContent = session.courses.length ? '検索条件に合う授業はありません。' : '登録されている授業はありません。';
-    fragment.append(empty);
-  }
+  if (!courses.length) fragment.append(node('p', session ? 'この範囲に授業はありません。絞り込みを変更してください。'
+    : 'ログインすると、資料を保存する授業を選べます。', 'no-results'));
   $('course-list').replaceChildren(fragment);
+  $('course-count').textContent = session ? `${courses.length}件の授業` : '未接続';
+  const year = $('year-filter').selectedOptions[0]?.textContent || 'すべての年度';
+  const quarter = $('quarter-filter').selectedOptions[0]?.textContent || 'すべて';
+  $('scope-summary').textContent = session ? `${year} / ${quarter} · 対象 ${courses.length}授業`
+    : 'ログインすると、現在の時期に合わせた範囲が選ばれます。';
   selection();
 }
 
+function initializeScope() {
+  $('year-filter').replaceChildren(new Option('すべての年度', 'all'),
+    ...courseYears(session.courses).map(year => new Option(`${year}年度`, year)));
+  const initial = defaultCourseScope(session.courses);
+  $('year-filter').value = initial.year;
+  $('quarter-filter').value = initial.quarter;
+  $('course-search').value = '';
+  $('assignment-filter').value = 'pending';
+}
+
+function scheduleAssignmentCheck(delay = 0) {
+  stopAssignmentCheck();
+  resetAssignments('loading');
+  busy();
+  if (!session || mode !== 'assignments') return;
+  if (!visibleCourses().length) {
+    assignmentState = 'idle';
+    renderAssignments();
+    status('対象の授業がありません。絞り込みを変更してください。');
+    return;
+  }
+  autoTimer = setTimeout(() => { autoTimer = null; checkAssignments(); }, delay);
+}
+
+async function checkAssignments() {
+  if (!session || mode !== 'assignments' || (operation && operationKind !== 'assignments')) return;
+  stopAssignmentCheck();
+  const currentSession = session;
+  const courses = visibleCourses();
+  if (!courses.length) return;
+  const controller = new AbortController();
+  operation = controller;
+  operationKind = 'assignments';
+  resetAssignments('loading');
+  busy(true);
+  status(`${courses.length}授業の未提出・提出状況を自動で確認しています…`);
+  try {
+    const result = await collectAssignments(currentSession.client, courses, {
+      signal: controller.signal,
+      onProgress: ({ index, total, course, name }) => {
+        if (operation !== controller) return;
+        $('progress').max = total;
+        $('progress').value = index;
+        status(`${index + 1}/${total}件 · ${courseMetadata({ fullname: course }).title} · ${assignmentText(name)}`);
+      },
+    });
+    if (controller.signal.aborted) throw new CancelledError();
+    if (session !== currentSession || operation !== controller) return;
+    assignmentResults = result;
+    assignmentCourses = courses;
+    assignmentState = 'ready';
+    renderAssignments();
+    const incomplete = result.warnings.length || result.items.some(item => item.status === 'unknown');
+    status(`${courses.length}授業・${result.items.length}件の確認が終わりました。${incomplete ? '確認できない情報があります。注意と各授業の表示を確認してください。' : '授業ごとに提出状況をまとめました。'}`, !!incomplete);
+  } catch (error) {
+    if (operation === controller && session === currentSession) {
+      resetAssignments(error instanceof CancelledError ? 'cancelled' : 'error');
+      status(errorMessage(error), !(error instanceof CancelledError));
+    }
+  } finally {
+    if (operation === controller) { operation = null; operationKind = null; busy(false); }
+  }
+}
+
+function changeMode(next) {
+  if (operation && operationKind !== 'assignments') return;
+  stopAssignmentCheck();
+  mode = next;
+  $('mode-assignments').setAttribute('aria-pressed', mode === 'assignments');
+  $('mode-materials').setAttribute('aria-pressed', mode === 'materials');
+  $('assignment-panel').hidden = mode !== 'assignments';
+  $('materials-panel').hidden = mode !== 'materials';
+  renderCourses();
+  if (mode === 'assignments' && session) scheduleAssignmentCheck();
+  else status(session ? '資料を保存する授業を選んでください。保存ボタンを押すまでダウンロードは始まりません。'
+    : 'Moodleにログインしてください。');
+}
+
+function scopeChanged(delay = 0) {
+  selected.clear();
+  renderCourses();
+  if (mode === 'assignments') scheduleAssignmentCheck(delay);
+  else status('保存対象を絞り込みました。授業を選んでください。');
+}
+
 function log(message, state = '') {
-  const row = document.createElement('p');
-  row.className = `log-row ${state}`;
-  row.textContent = message;
+  const row = node('p', message, `log-row ${state}`);
   $('activity-log').append(row);
   $('activity-log').scrollTop = $('activity-log').scrollHeight;
 }
-
-function errorMessage(error) {
-  return error instanceof MoodleError ? error.message : '処理に失敗しました。再度お試しください。';
-}
+function errorMessage(error) { return error instanceof MoodleError ? error.message : '処理に失敗しました。再度お試しください。'; }
 
 const canStorePassword = typeof window.PasswordCredential === 'function' && !!navigator.credentials?.store;
 const canSaveDirectly = typeof window.showSaveFilePicker === 'function';
@@ -203,6 +315,7 @@ $('login-form').addEventListener('submit', async event => {
   if (operation) return;
   const controller = new AbortController();
   operation = controller;
+  operationKind = 'login';
   busy(true);
   status('Moodleにログインして、授業一覧を取得しています…');
   try {
@@ -214,12 +327,8 @@ $('login-form').addEventListener('submit', async event => {
         const credential = new PasswordCredential({ id: username, password, name: cleanName(session.info.fullname || username) });
         Promise.resolve(navigator.credentials.store(credential)).then(() => {
           $('password-note').textContent = '保存・自動入力の設定は、ブラウザのパスワードマネージャーで確認できます。';
-        }).catch(() => {
-          $('password-note').textContent = 'ブラウザに保存を依頼できませんでした。パスワードマネージャーの設定を確認してください。';
-        });
-      } catch {
-        $('password-note').textContent = 'ブラウザに保存を依頼できませんでした。パスワードマネージャーの設定を確認してください。';
-      }
+        }).catch(() => { $('password-note').textContent = 'ブラウザに保存を依頼できませんでした。パスワードマネージャーの設定を確認してください。'; });
+      } catch { $('password-note').textContent = 'ブラウザに保存を依頼できませんでした。'; }
     }
     $('password').value = '';
     $('password').type = 'password';
@@ -230,89 +339,67 @@ $('login-form').addEventListener('submit', async event => {
     $('session-box').hidden = false;
     $('account-name').textContent = cleanName(session.info.fullname || username);
     $('account-heading').textContent = 'ログイン中';
-    $('course-count').textContent = `${session.courses.length}件の授業`;
+    initializeScope();
     renderCourses();
-    status('ログインしました。課題を確認、または資料を取得する授業を選んでください。');
+    resetAssignments();
+    status('ログインしました。資料を保存する授業を選んでください。');
   } catch (error) {
     session?.client.clear();
     session = null;
     status(errorMessage(error), !(error instanceof CancelledError));
   } finally {
     operation = null;
+    operationKind = null;
     busy(false);
   }
+  if (session && mode === 'assignments') scheduleAssignmentCheck();
 });
 
 $('logout-button').addEventListener('click', () => {
-  if (operation) return;
+  if (operation && operationKind !== 'assignments') return;
+  stopAssignmentCheck();
   session?.client.clear();
   session = null;
   selected.clear();
   clearArchive();
-  clearAssignments();
   $('login-form').hidden = false;
   $('session-box').hidden = true;
   $('password').value = '';
   $('remember').checked = false;
   $('course-search').value = '';
+  $('year-filter').replaceChildren(new Option('すべての年度', 'all'));
+  $('quarter-filter').value = 'all';
+  $('assignment-filter').value = 'pending';
   $('account-heading').textContent = 'Moodleにログイン';
   $('account-name').textContent = '';
-  $('course-count').textContent = '未接続';
-  $('selected-count').textContent = '0';
-  $('course-list').replaceChildren(initialEmptyState.cloneNode(true));
   $('activity-log').replaceChildren();
-  status('ログアウトしました。保存したパスワードの削除は、ブラウザのパスワードマネージャーから行えます。');
+  resetAssignments();
+  renderCourses();
+  status('ログアウトしました。保存したパスワードの削除はブラウザの設定から行えます。');
   busy(false);
 });
 
-$('course-search').addEventListener('input', renderCourses);
+$('mode-assignments').addEventListener('click', () => changeMode('assignments'));
+$('mode-materials').addEventListener('click', () => changeMode('materials'));
+$('year-filter').addEventListener('change', () => scopeChanged());
+$('quarter-filter').addEventListener('change', () => scopeChanged());
+$('course-search').addEventListener('input', () => scopeChanged(250));
 $('select-all').addEventListener('click', () => {
   const shown = visibleCourses();
   const remove = shown.every(course => selected.has(course.id));
   for (const course of shown) { if (remove) selected.delete(course.id); else selected.add(course.id); }
   renderCourses();
 });
-
 $('assignment-filter').addEventListener('change', renderAssignments);
-$('assignment-button').addEventListener('click', async () => {
-  if (operation || !session || !selected.size) return;
-  const currentSession = session;
-  const courses = currentSession.courses.filter(course => selected.has(course.id));
-  const controller = new AbortController();
-  operation = controller;
-  clearAssignments();
-  busy(true);
-  status('選択した授業の課題一覧を確認しています…');
-  try {
-    const result = await collectAssignments(currentSession.client, courses, {
-      signal: controller.signal,
-      onProgress: ({ index, total, name }) => {
-        $('progress').max = total;
-        $('progress').value = index;
-        status(`${index + 1} / ${total}件 · ${assignmentText(name)} の提出状況を確認しています…`);
-      },
-    });
-    if (controller.signal.aborted) throw new CancelledError();
-    if (session !== currentSession || operation !== controller) return;
-    assignmentResults = result;
-    renderAssignments();
-    const unknown = result.items.filter(item => item.status === 'unknown').length;
-    status(`${result.items.length}件の課題を取得しました。${unknown || result.warnings.length
-      ? ' 一部の課題・提出状況を確認できませんでした。下の結果を確認してください。' : ' 締切と提出状況を下に表示しています。'}`,
-    !!(unknown || result.warnings.length));
-  } catch (error) {
-    if (session === currentSession && operation === controller) status(errorMessage(error), !(error instanceof CancelledError));
-  } finally {
-    if (operation === controller) { operation = null; busy(false); }
-  }
-});
+$('assignment-button').addEventListener('click', () => checkAssignments());
 
 $('download-button').addEventListener('click', async () => {
-  if (operation || !session || !selected.size) return;
+  if (operation || !session || mode !== 'materials' || !selected.size) return;
   const courses = session.courses.filter(course => selected.has(course.id));
   const preview = $('preview').checked;
   const controller = new AbortController();
   operation = controller;
+  operationKind = 'download';
   clearArchive();
   $('activity-log').replaceChildren();
   busy(true);
@@ -374,15 +461,19 @@ $('download-button').addEventListener('click', async () => {
   } finally {
     await writable?.abort().catch(() => {});
     operation = null;
+    operationKind = null;
     busy(false);
   }
 });
 
 $('cancel-button').addEventListener('click', () => {
+  clearTimeout(autoTimer);
+  autoTimer = null;
   operation?.abort();
   $('cancel-button').disabled = true;
   status('処理を中止しています…');
 });
 
-const initialEmptyState = $('course-list').firstElementChild.cloneNode(true);
-$('login-button').disabled = false;
+renderCourses();
+renderAssignments();
+busy(false);

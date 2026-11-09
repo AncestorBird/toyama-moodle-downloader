@@ -43,6 +43,7 @@ async function mockMoodle(page, { invalidLogin = false } = {}) {
 }
 
 async function signIn(page) {
+  await page.locator('#mode-materials').click();
   await page.getByLabel('ユーザー名', { exact: true }).fill('test-user');
   await page.getByLabel('パスワード', { exact: true }).fill('test-password');
   await page.getByRole('button', { name: /^ログイン/ }).click();
@@ -54,16 +55,17 @@ test('login, select, download a valid ZIP, then log out without retaining secret
   page.on('pageerror', error => errors.push(error.message));
   const requests = await mockMoodle(page);
   await page.goto('./');
-  await expect(page.locator('h1')).toContainText('授業の資料を、');
+  await expect(page.locator('h1')).toContainText('授業ごとの課題と資料');
+  await expect(page.locator('#mode-assignments')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#materials-panel')).toBeHidden();
   await expect(page.locator('.download-hint')).toContainText('合計1 GB');
-  await expect(page.locator('.brand-icon')).toHaveCSS('background-color', 'rgb(23, 100, 90)');
   await signIn(page);
   await expect(page.locator('.course-row')).toHaveCount(3);
   await expect(page.locator('#password')).toHaveValue('');
   await expect(page.locator('#course-list img')).toHaveCount(0);
   await page.locator('.course-row').filter({ hasText: '情報処理演習' }).getByRole('checkbox').check();
   const downloading = page.waitForEvent('download');
-  await page.getByRole('button', { name: '選択した授業の資料を取得' }).click();
+  await page.getByRole('button', { name: '選択した授業の資料を保存' }).click();
   const download = await downloading;
   expect(download.suggestedFilename()).toMatch(/^moodle-materials-\d{4}-\d{2}-\d{2}\.zip$/);
   const zip = unzipSync(new Uint8Array(await readFile(await download.path())));
@@ -102,7 +104,7 @@ test('supported browsers select a destination and stream a valid ZIP into it', a
   await page.goto('./');
   await signIn(page);
   await page.locator('.course-row').first().getByRole('checkbox').check();
-  await page.getByRole('button', { name: '選択した授業の資料を取得' }).click();
+  await page.getByRole('button', { name: '選択した授業の資料を保存' }).click();
   await expect(page.getByRole('status')).toContainText('ZIPを保存しました。取得 1件 / 失敗 0件');
   const result = await page.evaluate(() => window.directSaveTest);
   expect(result.closed).toBe(true);
@@ -121,7 +123,7 @@ test('cancelling the save dialog does not request course contents or files', asy
   await page.goto('./');
   await signIn(page);
   await page.locator('.course-row').first().getByRole('checkbox').check();
-  await page.getByRole('button', { name: '選択した授業の資料を取得' }).click();
+  await page.getByRole('button', { name: '選択した授業の資料を保存' }).click();
   await expect(page.getByRole('status')).toContainText('取得を中止');
   expect(requests.filter(r => r.url.includes('/pluginfile.php/') || r.params.get('wsfunction') === 'core_course_get_contents')).toHaveLength(0);
   await expect(page.locator('#download-button')).toBeEnabled();
@@ -137,8 +139,8 @@ test('search selects only visible courses, and preview does not request files', 
   await expect(page.locator('.course-row')).toHaveCount(1);
   await page.getByRole('button', { name: '表示中をすべて選択' }).click();
   await expect(page.locator('#selected-count')).toHaveText('1');
-  await page.getByLabel('まず取得予定の資料だけ確認する').check();
-  await page.getByRole('button', { name: '選択した授業の資料を取得' }).click();
+  await page.getByLabel('保存する前に資料の一覧だけ確認する').check();
+  await page.getByRole('button', { name: '選択した授業の資料を保存' }).click();
   await expect(page.getByRole('status')).toContainText('取得予定: 1件');
   expect(requests.filter(r => r.url.includes('/pluginfile.php/'))).toHaveLength(0);
   expect(requests.find(r => r.params.get('wsfunction') === 'core_course_get_contents').params.get('courseid')).toBe('456');
@@ -194,7 +196,7 @@ test('cancelling an active download produces no archive and controls recover', a
   await page.goto('./');
   await signIn(page);
   await page.locator('.course-row').first().getByRole('checkbox').check();
-  await page.getByRole('button', { name: '選択した授業の資料を取得' }).click();
+  await page.getByRole('button', { name: '選択した授業の資料を保存' }).click();
   try {
     await fileStarted;
     await page.getByRole('button', { name: '中止する' }).click();
