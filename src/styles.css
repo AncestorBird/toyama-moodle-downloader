@@ -5,7 +5,7 @@
 body { margin: 0; font-size: 14px; line-height: 1.65; }
 [hidden] { display: none !important; }
 a { color: inherit; }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button, a, input { -webkit-tap-highlight-color: transparent; }
 button { cursor: pointer; }
 button:disabled, input:disabled { cursor: default; }
@@ -87,6 +87,28 @@ h1 { font-size: clamp(28px, 4vw, 40px); letter-spacing: .02em; line-height: 1.5;
 .selection-summary p > span { display: block; color: #97a094; font-size: 10px; margin-top: 3px; }
 .preview-option { font-size: 11px; margin-bottom: 13px; }
 .download-hint { text-align: center; font-size: 10px; color: #97a193; margin: 9px 0 0; }
+#assignment-button { margin-bottom: 19px; }
+.assignment-panel { margin-top: 26px; padding: 22px 25px; }
+.assignment-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; }
+.assignment-toolbar h2 { margin: 0; font-size: 16px; }
+.assignment-toolbar label { font-size: 12px; display: flex; align-items: center; gap: 8px; max-width: 100%; }
+.assignment-toolbar select { border: 1px solid var(--border); border-radius: 6px; padding: 7px; background: #fff; color: #213734; min-width: 0; max-width: 100%; }
+.assignment-summary { font-size: 12px; color: #50625a; margin: 16px 0 8px; }
+.assignment-note { font-size: 11px; color: #74807d; margin: 8px 0 17px; }
+.assignment-warnings { font-size: 12px; color: #8b5236; overflow-wrap: anywhere; }
+.assignment-row { border-top: 1px solid var(--border); padding: 19px 0; overflow-wrap: anywhere; }
+.assignment-row:last-child { padding-bottom: 0; }
+.assignment-course { margin: 0 0 4px; color: #74807d; font-size: 11px; }
+.assignment-row h3 { font-size: 15px; font-weight: 600; margin: 0 0 9px; }
+.assignment-row h3 a { text-decoration-color: #b5c8be; text-underline-offset: 3px; }
+.assignment-meta { display: flex; align-items: baseline; gap: 10px 16px; flex-wrap: wrap; font-size: 12px; }
+.assignment-state { background: #f2f5f2; color: #52655b; padding: 3px 9px; border-radius: 5px; }
+.assignment-state.submitted { color: #17645a; background: #eaf4ee; }
+.assignment-state.unknown { color: #8b5236; background: #fcf2e9; }
+.assignment-row details { margin-top: 12px; font-size: 12px; }
+.assignment-row summary { cursor: pointer; color: var(--green); }
+.assignment-description { white-space: pre-wrap; line-height: 1.85; color: #50625a; }
+.assignment-row .assignment-warning { font-size: 12px; color: #8b5236; margin: 10px 0; }
 .activity-card { margin-top: 26px; padding: 21px 25px; }
 .activity-top { display: flex; align-items: center; justify-content: space-between; min-height: 27px; }
 .activity-top h2 { font-size: 13px; }
@@ -111,4 +133,5 @@ footer summary { cursor: pointer; text-align: right; }
 @media (max-width: 1180px) { main { margin: 0 36px; } }
 @media (max-width: 800px) { .workspace { grid-template-columns: 285px minmax(0, 1fr); gap: 18px; } .account-card { padding: 21px 18px; } .course-toolbar { flex-direction: column; align-items: stretch; gap: 3px; } .course-toolbar .text-button { text-align: right; } .courses-top, .download-panel { padding-left: 20px; padding-right: 20px; } .course-row { padding-left: 20px; padding-right: 20px; } }
 @media (max-width: 640px) { .site-header { height: 76px; padding: 0 22px; } .brand { font-size: 15px; } .brand-icon { width: 34px; height: 34px; } main { margin: 0 20px; } .intro { padding: 27px 0 28px; } h1 { font-size: 29px; } .mobile-break { display: inline; } .intro-description { font-size: 12px; } .workspace { grid-template-columns: 1fr; gap: 22px; } .account-card { padding: 22px; } .guide-card { display: none; } .courses-top { padding: 21px 20px 18px; } .course-toolbar { flex-direction: row; padding: 0 20px 15px; gap: 12px; } .course-list { height: 280px; } .activity-card { margin-top: 22px; padding: 18px 20px; } footer { gap: 12px; margin-top: 22px; } footer summary { text-align: left; } }
+@media (max-width: 640px) { .assignment-panel { padding: 18px 20px; margin-top: 22px; } .assignment-toolbar label { align-items: flex-start; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

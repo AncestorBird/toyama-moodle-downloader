@@ -382,6 +382,168 @@ class MemoryBackend:
         self.raw = None
 
 
+class AssignmentTests(unittest.TestCase):
+    def assignment(self, **extra):
+        return {"id": 12, "cmid": 34, "name": "レポート", "duedate": 1794906000,
+                "intro": "<p>紙で提出済みの人は不要。</p>", "teamsubmission": 0, **extra}
+
+    def status(self, state="new", **extra):
+        return {"lastattempt": {"submission": {"status": state, "plugins": []},
+                                 "extensionduedate": None, **extra}, "warnings": []}
+
+    def client(self, assignments=None, statuses=None, warnings=None):
+        assignments = [self.assignment()] if assignments is None else assignments
+        statuses = [self.status()] if statuses is None else statuses
+        client = Mock()
+        client.call.side_effect = [
+            {"courses": [{"id": 123, "assignments": assignments}], "warnings": warnings or []},
+            *statuses,
+        ]
+        return client
+
+    def report(self, client):
+        return moodle.assignment_report(client, [{"id": 123, "fullname": "実験B"}])
+
+    def test_selected_courses_use_read_api_and_keep_authentication_in_post(self):
+        client = moodle.Client()
+        client.token = "dummy-token"
+        with patch.object(client.opener, "open", return_value=Response(b'{"courses":[],"warnings":[]}')) as opening:
+            self.report(client)
+        request = opening.call_args.args[0]
+        params = urllib.parse.parse_qs(request.data.decode())
+        self.assertEqual(params["wsfunction"], ["mod_assign_get_assignments"])
+        self.assertEqual(params["courseids[0]"], ["123"])
+        self.assertEqual(params["wstoken"], ["dummy-token"])
+        self.assertNotIn("dummy-token", request.full_url)
+        with patch.object(client.opener, "open", return_value=Response(b'{}')) as opening:
+            client.call("mod_assign_get_submission_status", assignid=12)
+        params = urllib.parse.parse_qs(opening.call_args.args[0].data.decode())
+        self.assertEqual(params["assignid"], ["12"])
+        with self.assertRaises(moodle.MoodleError):
+            client.call("mod_assign_submit_for_grading", assignmentid=12)
+
+    def test_submitted_draft_reopened_and_unknown_are_distinct(self):
+        labels = {"submitted": "提出済み", "draft": "下書き（提出確定前）",
+                  "reopened": "再提出待ち", "new": "Moodle上は未提出"}
+        for state, label in labels.items():
+            summary = moodle.assignment_summary(self.assignment(), self.status(state))
+            self.assertEqual(summary["label"], label)
+            self.assertFalse(summary["unknown"])
+        report = self.report(self.client(statuses=[self.status("future-state")]))
+        self.assertEqual(report["failed"], 1)
+        self.assertIn("未確認", report["items"][0]["label"])
+
+    def test_extension_date_and_zero_due_do_not_drop_written_deadlines(self):
+        summary = moodle.assignment_summary(self.assignment(), self.status(extensionduedate=1794992400))
+        self.assertEqual(summary["due"], "2026-11-18 18:00 JST")
+        self.assertIn("延長後の期限を表示", summary["notes"])
+        assignment = self.assignment(duedate=0, intro="<p>各回の翌週火曜日13時までに提出。</p>")
+        report = self.report(self.client(assignments=[assignment]))
+        with redirect_stdout(io.StringIO()) as log:
+            result = moodle.print_assignment_report(report)
+        self.assertEqual(result, 0)
+        self.assertIn("日時未設定", log.getvalue())
+        self.assertIn("各回の翌週火曜日13時", log.getvalue())
+        self.assertNotIn("期限なし", log.getvalue())
+
+    def test_group_status_takes_priority_and_remaining_members_are_reported(self):
+        assignment = self.assignment(teamsubmission=1)
+        status = self.status("new", teamsubmission={"status": "submitted", "plugins": []})
+        summary = moodle.assignment_summary(assignment, status)
+        self.assertEqual(summary["label"], "提出済み")
+        self.assertIn("グループ提出", summary["notes"])
+        status["lastattempt"]["submissiongroupmemberswhoneedtosubmit"] = [42]
+        summary = moodle.assignment_summary(assignment, status)
+        self.assertEqual(summary["label"], "グループ提出の確定待ち")
+        del status["lastattempt"]["teamsubmission"]
+        with self.assertRaises(moodle.MoodleError):
+            moodle.assignment_summary(assignment, status)
+
+    def test_file_names_and_activity_are_shown_without_file_downloads(self):
+        status = self.status("submitted")
+        status["lastattempt"]["submission"]["plugins"] = [{"type": "file", "fileareas": [
+            {"files": [{"filename": "レポート.pdf", "fileurl": "https://invalid.example/unused"}]}]}]
+        status["assignmentdata"] = {"activity": "<p>紙で提出済みの場合、追加提出は不要です。</p>"}
+        client = self.client(statuses=[status])
+        report = self.report(client)
+        with redirect_stdout(io.StringIO()) as log:
+            moodle.print_assignment_report(report)
+        self.assertIn("レポート.pdf", log.getvalue())
+        self.assertIn("課題の指示: 紙で提出済みの場合", log.getvalue())
+        self.assertNotIn("invalid.example", log.getvalue())
+        client.file_response.assert_not_called()
+
+    def test_item_failure_and_listing_warnings_remain_visible_and_do_not_stop_next_item(self):
+        client = self.client(assignments=[self.assignment(), self.assignment(id=13, cmid=35)],
+                             statuses=[moodle.MoodleError("応答なし"), self.status("submitted")],
+                             warnings=[{"itemid": 99, "message": "unavailable"}])
+        report = self.report(client)
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(report["warnings"], 1)
+        self.assertEqual(report["items"][1]["label"], "提出済み")
+        with redirect_stdout(io.StringIO()) as log:
+            result = moodle.print_assignment_report(report)
+        self.assertEqual(result, 1)
+        self.assertIn("状況未確認 1件 / API警告 1件", log.getvalue())
+        self.assertIn("Moodle本体でも確認", log.getvalue())
+
+    def test_status_warning_never_counts_as_confirmed_submission_and_keeps_instructions(self):
+        status = self.status("submitted")
+        status["warnings"] = [{"warningcode": "unknown"}]
+        status["assignmentdata"] = {"activity": "提出時の条件を確認"}
+        report = self.report(self.client(statuses=[status]))
+        self.assertEqual(report["warnings"], 1)
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(report["items"][0]["label"], "未確認（取得失敗）")
+        self.assertEqual(report["items"][0]["activity"], "提出時の条件を確認")
+
+    def test_listing_activity_is_preserved_when_status_has_no_activity_or_fails(self):
+        for status in (self.status(), moodle.MoodleError("応答なし")):
+            client = self.client(assignments=[self.assignment(activity="<p>翌週火曜日13時まで</p>")],
+                                 statuses=[status])
+            report = self.report(client)
+            self.assertEqual(report["items"][0]["activity"], "翌週火曜日13時まで")
+
+    def test_paper_note_and_html_are_plain_text_without_terminal_controls(self):
+        html = '<p>紙で提出済みの人は不要。</p><script>secret()</script><p>期限\x1b[31mです</p>'
+        report = self.report(self.client(assignments=[self.assignment(intro=html)]))
+        with redirect_stdout(io.StringIO()) as log:
+            moodle.print_assignment_report(report)
+        self.assertIn("紙で提出済みの人は不要。", log.getvalue())
+        self.assertIn("紙や別経路", log.getvalue())
+        self.assertNotIn("secret()", log.getvalue())
+        self.assertNotIn("\x1b", log.getvalue())
+        self.assertNotIn("<p>", log.getvalue())
+
+    def test_malformed_metadata_cannot_construct_links_or_status_requests(self):
+        client = self.client(assignments=[self.assignment(cmid="34&token=secret")])
+        report = self.report(client)
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(client.call.call_count, 1)
+        self.assertEqual(report["items"][0]["url"], "")
+        with self.assertRaises(moodle.MoodleError):
+            moodle.assignment_date(2**80)
+
+    def test_assignment_mode_does_not_create_download_folder_or_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "not-created"
+            args = argparse.Namespace(check=False, list=False, course=[123], assignments=True,
+                                      dry_run=False, output=output, no_save=True, login=False,
+                                      forget_login=False)
+            client = self.client()
+            responses = client.call.side_effect
+            client.public_config.return_value = {"sitename": "テスト", "enablemobilewebservice": 1}
+            client.call.side_effect = [
+                [{"id": 123, "fullname": "実験B"}], *list(responses),
+            ]
+            with (patch.object(moodle, "Client", return_value=client),
+                  patch.object(moodle, "authenticate", return_value={"userid": 10}),
+                  redirect_stdout(io.StringIO())):
+                self.assertEqual(moodle.run(args), 0)
+            self.assertFalse(output.exists())
+            client.file_response.assert_not_called()
+
+
 class AuthenticationTests(unittest.TestCase):
     def setUp(self):
         self.store = moodle.CredentialStore.__new__(moodle.CredentialStore)

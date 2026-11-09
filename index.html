@@ -3,10 +3,10 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="富山大学Moodleの授業資料を、選んでまとめてダウンロード。">
+    <meta name="description" content="富山大学Moodleの授業資料を取得し、課題の締切・提出状況を確認。">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://moodle52.u-toyama.ac.jp; object-src 'none'; base-uri 'none'; form-action 'none'">
     <meta name="referrer" content="no-referrer">
-    <title>Moodle資料取得 | 富山大学</title>
+    <title>Moodle資料取得・課題確認 | 富山大学</title>
     <link rel="icon" href="./cloud-icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="./src/styles.css">
     <script type="module" src="./src/bootstrap.js"></script>
@@ -24,7 +24,7 @@
       <section class="intro">
         <p class="eyebrow"><span></span> 富山大学 · 専門科目 / その他</p>
         <h1>授業の資料を、<br class="mobile-break">ひとまとめに。</h1>
-        <p class="intro-description">必要な授業を選んで、資料をまとめてダウンロード。<br>保存したファイルは、授業ごとのフォルダに整理されます。</p>
+        <p class="intro-description">必要な授業を選んで、資料をまとめてダウンロード。<br>課題の締切と提出状況も、同じ画面で確認できます。</p>
       </section>
 
       <div class="workspace">
@@ -55,7 +55,7 @@
           </section>
           <section class="guide-card" aria-labelledby="guide-heading">
             <h2 id="guide-heading">使い方</h2>
-            <ol><li>自分のMoodleアカウントでログイン</li><li>資料が必要な授業にチェック</li><li>ZIPファイルをダウンロード</li></ol>
+            <ol><li>自分のMoodleアカウントでログイン</li><li>確認したい授業にチェック</li><li>課題を確認、または資料を取得</li></ol>
             <p>保存先はブラウザのダウンロード設定に従います。</p>
           </section>
         </aside>
@@ -70,7 +70,8 @@
             <div class="empty-state"><span class="empty-icon" aria-hidden="true">▤</span><h3>ここに授業が表示されます</h3><p>Moodleにログインすると、<br>登録している授業を選べます。</p></div>
           </div>
           <div class="download-panel">
-            <div class="selection-summary"><span class="selection-number" id="selected-count">0</span><p>件の授業を選択中<span>授業内の取得可能な資料をZIPにまとめます</span></p></div>
+            <div class="selection-summary"><span class="selection-number" id="selected-count">0</span><p>件の授業を選択中<span>課題の確認と資料の取得に使う授業です</span></p></div>
+            <button id="assignment-button" type="button" class="button secondary full-width" disabled>選択した授業の課題を確認</button>
             <label class="checkbox-label preview-option"><input id="preview" type="checkbox" disabled>まず取得予定の資料だけ確認する</label>
             <button id="download-button" type="button" class="button primary full-width" disabled><span aria-hidden="true">↓</span> 選択した授業の資料を取得</button>
             <p class="download-hint">1ファイル50 MB・合計1 GBまで。授業は複数選べます。</p>
@@ -81,9 +82,27 @@
       <section class="card activity-card" aria-labelledby="activity-heading">
         <div class="activity-top"><h2 id="activity-heading">取得状況</h2><button id="cancel-button" type="button" class="text-button" hidden>中止する</button></div>
         <p id="status" class="status" role="status" aria-live="polite">ログインして、取得する授業を選んでください。</p>
-        <progress id="progress" value="0" max="1" aria-label="資料の取得状況" hidden></progress>
+        <progress id="progress" value="0" max="1" aria-label="取得の進行状況" hidden></progress>
         <div id="activity-log" class="activity-log" aria-label="資料の取得結果"></div>
         <a id="archive-link" class="button secondary archive-link" hidden>ZIPをもう一度保存</a>
+      </section>
+
+      <section id="assignment-panel" class="card assignment-panel" aria-labelledby="assignment-heading" hidden>
+        <div class="assignment-toolbar">
+          <h2 id="assignment-heading">課題・提出状況</h2>
+          <label for="assignment-filter">表示
+            <select id="assignment-filter">
+              <option value="all">すべて</option>
+              <option value="pending">未提出・下書き・再提出待ち</option>
+              <option value="submitted">提出済み</option>
+              <option value="unknown">確認できなかった課題</option>
+            </select>
+          </label>
+        </div>
+        <p id="assignment-summary" class="assignment-summary"></p>
+        <p class="assignment-note">Moodleに記録された状態です。紙などで提出済みの場合は未提出と表示されることがあります。課題の説明と授業での指示を確認してください。締切は日本時間（JST）です。</p>
+        <div id="assignment-warnings" class="assignment-warnings"></div>
+        <div id="assignment-list" class="assignment-list"></div>
       </section>
 
       <footer>
@@ -93,6 +112,7 @@
           <p>アプリはパスワード・トークンをlocalStorageやCookieに保存しません。ブラウザのパスワード保存・同期は、ご自身のブラウザ設定で管理してください。保存された項目の削除もパスワードマネージャーで行えます。</p>
           <p>ログアウト・ページ再読み込みで、この画面の認証トークンは破棄されます。大学側のトークンを失効させる操作は行いません。発行されるAPIトークン自体が読み取り専用とは限りません。</p>
           <p>授業内容APIに掲載されたMoodle内のファイルが対象です。外部サイト・ストリーミング動画・追加認証には対応しません。Web版は毎回新しいZIPを作成し、取得済みファイルとの差分判定はしません。大容量資料や差分取得にはGitHubのCLI版を利用できます。</p>
+          <p>課題確認は、選んだ授業のMoodle課題と提出状態を読み取ります。小テスト・紙提出・非公開や閲覧権限のない課題は対象外です。課題を提出・変更する操作は行いません。取得した提出状態はログアウト・再読み込みで消去されます。</p>
           <p>このページの配信元としてGitHub Pagesにも通常のアクセス情報が送られます。ブラウザの拡張機能やパスワード同期機能は、それぞれの設定に従います。</p>
         </div></details>
       </footer>

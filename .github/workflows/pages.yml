@@ -62,6 +62,22 @@ jobs:
               message = detail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
               print(f'::error title=CLI test {case.id()}::{message}', flush=True)
           sys.exit(0 if result.wasSuccessful() else 1)
+      - name: Smoke test native launchers without login
+        shell: python
+        run: |
+          import pathlib
+          import subprocess
+          import sys
+          suffix = '*.bat' if sys.platform == 'win32' else '*.command'
+          launchers = sorted(pathlib.Path.cwd().glob(suffix))
+          assert len(launchers) >= 2, 'Download and assignment launchers are required'
+          for launcher in launchers:
+              command = (['cmd', '/d', '/c', str(launcher), '--help'] if sys.platform == 'win32'
+                         else ['zsh', str(launcher), '--help'])
+              result = subprocess.run(command, input=b'\n', capture_output=True, timeout=30)
+              assert result.returncode == 0, f'{launcher.name}: exit {result.returncode}: {result.stderr!r}'
+              assert b'--assignments' in result.stdout, f'{launcher.name}: CLI help missing'
+              print(f'{launcher.name}: passed')
 
   deploy:
     if: github.event_name != 'pull_request'

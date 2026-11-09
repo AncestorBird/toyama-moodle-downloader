@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""富山大学Moodleの公式APIで授業資料を取得する。認証情報はOSの保管庫に保存。"""
+"""富山大学Moodleの公式APIで資料取得・課題の提出状況確認を行う。"""
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import getpass
 import hashlib
 import html
@@ -15,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
+from html.parser import HTMLParser
 
 from safe_output import Directory
 
@@ -69,7 +71,11 @@ READ_FUNCTIONS = {
     "core_webservice_get_site_info",
     "core_enrol_get_users_courses",
     "core_course_get_contents",
+    "mod_assign_get_assignments",
+    "mod_assign_get_submission_status",
 }
+
+JST = timezone(timedelta(hours=9), "JST")
 
 
 class MoodleError(Exception):
@@ -333,6 +339,162 @@ def material_files(course, sections):
                 yield item, relative
 
 
+class AssignmentText(HTMLParser):
+    """Convert Moodle's HTML descriptions to text without terminal controls."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style"}:
+            self.hidden += 1
+        elif not self.hidden and tag in {"br", "p", "div", "li", "tr", "h1", "h2", "h3"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"} and self.hidden:
+            self.hidden -= 1
+        elif not self.hidden and tag in {"p", "div", "li", "tr", "h1", "h2", "h3"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def assignment_text(value):
+    parser = AssignmentText()
+    parser.feed(str(value or ""))
+    text = "".join(parser.parts)
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]", "", text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def assignment_date(value):
+    if value in (None, 0):
+        return "日時未設定（説明欄の期限指定も確認）"
+    if type(value) is not int or value < 0:
+        raise MoodleError("課題の期限日時が正しくありません。")
+    try:
+        return datetime.fromtimestamp(value, JST).strftime("%Y-%m-%d %H:%M JST")
+    except (OverflowError, OSError, ValueError):
+        raise MoodleError("課題の期限日時が正しくありません。") from None
+
+
+def assignment_summary(assignment, status):
+    """Only the latest submission state establishes whether Moodle has a submission."""
+    attempt = status.get("lastattempt")
+    if not isinstance(attempt, dict):
+        raise MoodleError("提出状況の応答を確認できませんでした。")
+    team = assignment.get("teamsubmission") in (1, True)
+    submission = attempt.get("teamsubmission" if team else "submission")
+    if not isinstance(submission, dict):
+        raise MoodleError("提出状況の応答を確認できませんでした。")
+    raw = submission.get("status")
+    labels = {
+        "submitted": "提出済み",
+        "new": "Moodle上は未提出",
+        "draft": "下書き（提出確定前）",
+        "reopened": "再提出待ち",
+    }
+    label = labels.get(raw, "未確認（未対応の提出状態）")
+    notes = []
+    if team:
+        notes.append("グループ提出")
+        if attempt.get("submissiongroupmemberswhoneedtosubmit"):
+            label = "グループ提出の確定待ち"
+            notes.append("提出操作が必要なメンバーが残っています")
+    if attempt.get("locked"):
+        notes.append("編集ロック中")
+    if attempt.get("submissionsenabled") is False:
+        notes.append("オンライン提出は無効。説明欄を確認してください")
+    due = assignment.get("duedate", 0)
+    extension = attempt.get("extensionduedate")
+    if extension:
+        due = extension
+        notes.append("延長後の期限を表示")
+    files = [assignment_text(f.get("filename", ""))
+             for plugin in submission.get("plugins", []) if plugin.get("type") == "file"
+             for area in plugin.get("fileareas", [])
+             for f in area.get("files", [])]
+    activity = assignment_text(status.get("assignmentdata", {}).get("activity") or assignment.get("activity", ""))
+    return {"state": raw, "label": label, "due": assignment_date(due), "activity": activity,
+            "notes": notes, "files": files, "unknown": raw not in labels}
+
+
+def assignment_report(client, courses):
+    """Read selected courses only; never save assignment data or invoke a write API."""
+    selected = {}
+    params = {}
+    for index, course in enumerate(courses):
+        require_id(course["id"])
+        selected[course["id"]] = course
+        params[f"courseids[{index}]"] = course["id"]
+    if not selected:
+        return {"items": [], "warnings": 0, "failed": 0}
+    response = client.call("mod_assign_get_assignments", **params)
+    if not isinstance(response, dict) or not isinstance(response.get("courses"), list):
+        raise MoodleError("課題一覧の応答を確認できませんでした。")
+    report = {"items": [], "warnings": len(response.get("warnings", [])), "failed": 0}
+    for course in response["courses"]:
+        if course.get("id") not in selected or not isinstance(course.get("assignments"), list):
+            raise MoodleError("選択した授業の課題一覧を確認できませんでした。")
+        for assignment in course["assignments"]:
+            item = {"course": assignment_text(selected[course["id"]]["fullname"]),
+                    "name": assignment_text(assignment.get("name", "名称なし")),
+                    "description": assignment_text(assignment.get("intro", "")),
+                    "activity": assignment_text(assignment.get("activity", "")), "url": ""}
+            try:
+                require_id(assignment.get("id"))
+                require_id(assignment.get("cmid"))
+                item["url"] = f'{SITE}/mod/assign/view.php?id={assignment["cmid"]}'
+                item["due"] = assignment_date(assignment.get("duedate", 0))
+                status = client.call("mod_assign_get_submission_status", assignid=assignment["id"])
+                if not isinstance(status, dict):
+                    raise MoodleError("提出状況の応答を確認できませんでした。")
+                item["activity"] = assignment_text(status.get("assignmentdata", {}).get("activity")
+                                                   or assignment.get("activity", ""))
+                report["warnings"] += len(status.get("warnings", []))
+                if status.get("warnings"):
+                    raise MoodleError("提出状況の取得にAPI警告があるため、状態を確定できませんでした。")
+                item.update(assignment_summary(assignment, status))
+                if item["unknown"]:
+                    report["failed"] += 1
+            except MoodleError as exc:
+                item.update(label="未確認（取得失敗）", error=str(exc))
+                report["failed"] += 1
+            report["items"].append(item)
+    return report
+
+
+def print_assignment_report(report):
+    print("\n課題・提出状況（日時は日本時間）")
+    print("紙や別経路での提出は、この表示だけでは判断できません。課題の説明も確認してください。")
+    for item in report["items"]:
+        print(f'\n[{item["label"]}] {item["name"]}')
+        print("  授業:", item["course"])
+        print("  締切:", item.get("due", "未確認"))
+        for note in item.get("notes", []):
+            print("  注記:", note)
+        for filename in item.get("files", []):
+            print("  提出ファイル:", filename)
+        if item["description"]:
+            print("  説明:", item["description"].replace("\n", "\n        "))
+        if item.get("activity") and item["activity"] != item["description"]:
+            print("  課題の指示:", item["activity"].replace("\n", "\n              "))
+        if item["url"]:
+            print("  URL:", item["url"])
+        if item.get("error"):
+            print("  エラー:", item["error"])
+    print(f'\n取得した課題 {len(report["items"])}件 / 状況未確認 {report["failed"]}件 / API警告 {report["warnings"]}件')
+    print("非公開・アクセス権限のない課題は確認できません。")
+    if report["warnings"]:
+        print("一部の課題・情報を取得できない旨のAPI警告があります。Moodle本体でも確認してください。")
+    return 1 if report["failed"] or report["warnings"] else 0
+
+
 def stream_digest(stream):
     digest = hashlib.sha256()
     for chunk in bounded_chunks(stream, MAX_FILE_BYTES, time.monotonic() + MAX_FILE_SECONDS):
@@ -457,13 +619,15 @@ def run(args):
     print(f"\nログイン成功。登録授業: {len(courses)}件")
     for course in courses:
         print(f'  ID {course["id"]}: {clean_name(course["fullname"])}')
+    assignments = getattr(args, "assignments", False)
     if args.list or not courses:
         return 0
     ids = args.course
     if not ids:
-        raw = input("\n取得する授業のID（複数はカンマ区切り、Enterで終了）: ").strip()
+        action = "課題を確認する" if assignments else "取得する"
+        raw = input(f"\n{action}授業のID（複数はカンマ区切り、Enterで終了）: ").strip()
         if not raw:
-            print("資料を取得せず終了しました。")
+            print("課題を確認せず終了しました。" if assignments else "資料を取得せず終了しました。")
             return 0
         try:
             ids = [int(v) for v in re.split(r"[,、\s]+", raw) if v]
@@ -472,6 +636,8 @@ def run(args):
     selected = [c for c in courses if c["id"] in ids]
     if set(ids) - {c["id"] for c in selected}:
         raise MoodleError("登録授業一覧にないIDが含まれています。")
+    if assignments:
+        return print_assignment_report(assignment_report(client, selected))
     root = args.output.expanduser().resolve()
     if not args.dry_run:
         root.mkdir(parents=True, exist_ok=True)
@@ -535,10 +701,12 @@ def main():
         print("Python 3.11以降で実行してください。", file=sys.stderr)
         return 1
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="公開設定だけ確認（ログイン不要）")
-    parser.add_argument("--list", action="store_true", help="ログインと授業一覧取得のみ")
-    parser.add_argument("--course", type=int, action="append", help="取得する授業ID（繰り返し指定可）")
-    parser.add_argument("--dry-run", action="store_true", help="資料一覧のみ確認し、保存しない")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="公開設定だけ確認（ログイン不要）")
+    mode.add_argument("--list", action="store_true", help="ログインと授業一覧取得のみ")
+    mode.add_argument("--assignments", action="store_true", help="課題・締切・提出状況を確認（保存・提出はしない）")
+    mode.add_argument("--dry-run", action="store_true", help="資料一覧のみ確認し、保存しない")
+    parser.add_argument("--course", type=int, action="append", help="取得・確認する授業ID（繰り返し指定可）")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="保存先")
     auth = parser.add_mutually_exclusive_group()
     auth.add_argument("--login", action="store_true", help="認証情報を再入力し、ログイン成功後に保存し直す")

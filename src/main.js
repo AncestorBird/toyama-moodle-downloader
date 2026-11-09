@@ -1,10 +1,12 @@
 import { CancelledError, login, MoodleError } from './api.js';
 import { cleanName, collectMaterials, createArchive, formatBytes } from './download.js';
+import { assignmentText, collectAssignments, formatDeadline } from './assignments.js';
 
 const $ = id => document.getElementById(id);
 let session = null;
 let operation = null;
 let archiveURL = null;
+let assignmentResults = null;
 const selected = new Set();
 
 function status(message, error = false) {
@@ -17,6 +19,8 @@ function busy(active) {
   for (const id of ['username', 'password', 'show-password', 'remember']) $(id).disabled = active;
   for (const id of ['logout-button', 'course-search', 'select-all', 'preview']) $(id).disabled = active || !session;
   $('download-button').disabled = active || !session || !selected.size;
+  $('assignment-button').disabled = active || !session || !selected.size;
+  $('assignment-filter').disabled = active;
   for (const input of $('course-list').querySelectorAll('input')) input.disabled = active;
   $('cancel-button').hidden = !active;
   $('cancel-button').disabled = !active;
@@ -33,6 +37,92 @@ function clearArchive() {
   $('archive-link').removeAttribute('href');
 }
 
+function clearAssignments() {
+  assignmentResults = null;
+  $('assignment-panel').hidden = true;
+  $('assignment-list').replaceChildren();
+  $('assignment-warnings').replaceChildren();
+  $('assignment-summary').textContent = '';
+  $('assignment-filter').value = 'all';
+}
+
+function renderAssignments() {
+  if (!assignmentResults) return;
+  const { items, warnings, checkedAt } = assignmentResults;
+  const submitted = items.filter(item => item.status === 'submitted').length;
+  const unknown = items.filter(item => item.status === 'unknown').length;
+  const pending = items.length - submitted - unknown;
+  $('assignment-summary').textContent = `${formatDeadline(Math.floor(checkedAt / 1000))} に確認 · ${items.length}件中、提出済み ${submitted}件 / 未提出等 ${pending}件 / 確認できず ${unknown}件`;
+  const warningNodes = warnings.map(message => {
+    const node = document.createElement('p');
+    node.textContent = message;
+    return node;
+  });
+  $('assignment-warnings').replaceChildren(...warningNodes);
+  const filter = $('assignment-filter').value;
+  const shown = items.filter(item => filter === 'all' || (filter === 'pending'
+    ? ['new', 'draft', 'reopened'].includes(item.status) : item.status === filter));
+  const fragment = document.createDocumentFragment();
+  for (const item of shown) {
+    const row = document.createElement('article');
+    row.className = 'assignment-row';
+    const course = document.createElement('p');
+    course.className = 'assignment-course';
+    course.textContent = assignmentText(item.course);
+    const title = document.createElement('h3');
+    const link = document.createElement('a');
+    link.href = item.url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = assignmentText(item.name) || '名称なし';
+    title.append(link);
+    const meta = document.createElement('div');
+    meta.className = 'assignment-meta';
+    const state = document.createElement('span');
+    state.className = `assignment-state ${item.status}`;
+    state.textContent = item.statusLabel;
+    const due = document.createElement('span');
+    due.textContent = `締切: ${formatDeadline(item.dueDate)}${item.extended ? '（個別延長）' : ''}`;
+    meta.append(state, due);
+    row.append(course, title, meta);
+    for (const message of [item.warning, item.error].filter(Boolean)) {
+      const warning = document.createElement('p');
+      warning.className = 'assignment-warning';
+      warning.textContent = message;
+      row.append(warning);
+    }
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = '課題の説明・提出ファイル';
+    const description = document.createElement('p');
+    description.className = 'assignment-description';
+    description.textContent = assignmentText(item.description) || '説明文はありません。詳しくは課題名のリンクからMoodleを確認してください。';
+    details.append(summary, description);
+    if (item.instructions && item.instructions !== item.description) {
+      const instructions = document.createElement('p');
+      instructions.className = 'assignment-description';
+      instructions.textContent = `課題の指示\n${assignmentText(item.instructions)}`;
+      details.append(instructions);
+    }
+    const files = document.createElement('p');
+    files.className = 'assignment-description';
+    files.textContent = item.files.length ? `登録ファイル: ${item.files.join('、')}`
+      : '登録ファイルは取得されませんでした。オンラインテキストや紙での提出状況はMoodle・授業の指示を確認してください。';
+    details.append(files);
+    row.append(details);
+    fragment.append(row);
+  }
+  if (!shown.length) {
+    const empty = document.createElement('p');
+    empty.className = 'no-results';
+    empty.textContent = items.length ? 'この表示条件に合う課題はありません。'
+      : '選択した授業から取得できる課題はありませんでした。非公開・閲覧制限のある課題や小テストは含まれません。';
+    fragment.append(empty);
+  }
+  $('assignment-list').replaceChildren(fragment);
+  $('assignment-panel').hidden = false;
+}
+
 function visibleCourses() {
   const query = $('course-search').value.trim().toLocaleLowerCase();
   return (session?.courses || []).filter(course =>
@@ -42,6 +132,7 @@ function visibleCourses() {
 function selection() {
   $('selected-count').textContent = selected.size;
   $('download-button').disabled = !!operation || !selected.size;
+  $('assignment-button').disabled = !!operation || !selected.size;
   const shown = visibleCourses();
   $('select-all').textContent = shown.length && shown.every(course => selected.has(course.id))
     ? '表示中の選択を解除' : '表示中をすべて選択';
@@ -141,7 +232,7 @@ $('login-form').addEventListener('submit', async event => {
     $('account-heading').textContent = 'ログイン中';
     $('course-count').textContent = `${session.courses.length}件の授業`;
     renderCourses();
-    status(`ログインしました。資料を取得する授業を選んでください。`);
+    status('ログインしました。課題を確認、または資料を取得する授業を選んでください。');
   } catch (error) {
     session?.client.clear();
     session = null;
@@ -158,12 +249,14 @@ $('logout-button').addEventListener('click', () => {
   session = null;
   selected.clear();
   clearArchive();
+  clearAssignments();
   $('login-form').hidden = false;
   $('session-box').hidden = true;
   $('password').value = '';
   $('remember').checked = false;
   $('course-search').value = '';
   $('account-heading').textContent = 'Moodleにログイン';
+  $('account-name').textContent = '';
   $('course-count').textContent = '未接続';
   $('selected-count').textContent = '0';
   $('course-list').replaceChildren(initialEmptyState.cloneNode(true));
@@ -178,6 +271,40 @@ $('select-all').addEventListener('click', () => {
   const remove = shown.every(course => selected.has(course.id));
   for (const course of shown) { if (remove) selected.delete(course.id); else selected.add(course.id); }
   renderCourses();
+});
+
+$('assignment-filter').addEventListener('change', renderAssignments);
+$('assignment-button').addEventListener('click', async () => {
+  if (operation || !session || !selected.size) return;
+  const currentSession = session;
+  const courses = currentSession.courses.filter(course => selected.has(course.id));
+  const controller = new AbortController();
+  operation = controller;
+  clearAssignments();
+  busy(true);
+  status('選択した授業の課題一覧を確認しています…');
+  try {
+    const result = await collectAssignments(currentSession.client, courses, {
+      signal: controller.signal,
+      onProgress: ({ index, total, name }) => {
+        $('progress').max = total;
+        $('progress').value = index;
+        status(`${index + 1} / ${total}件 · ${assignmentText(name)} の提出状況を確認しています…`);
+      },
+    });
+    if (controller.signal.aborted) throw new CancelledError();
+    if (session !== currentSession || operation !== controller) return;
+    assignmentResults = result;
+    renderAssignments();
+    const unknown = result.items.filter(item => item.status === 'unknown').length;
+    status(`${result.items.length}件の課題を取得しました。${unknown || result.warnings.length
+      ? ' 一部の課題・提出状況を確認できませんでした。下の結果を確認してください。' : ' 締切と提出状況を下に表示しています。'}`,
+    !!(unknown || result.warnings.length));
+  } catch (error) {
+    if (session === currentSession && operation === controller) status(errorMessage(error), !(error instanceof CancelledError));
+  } finally {
+    if (operation === controller) { operation = null; busy(false); }
+  }
 });
 
 $('download-button').addEventListener('click', async () => {

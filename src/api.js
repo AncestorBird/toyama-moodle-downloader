@@ -3,6 +3,7 @@ export const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
 const READ_FUNCTIONS = new Set([
   'core_webservice_get_site_info', 'core_enrol_get_users_courses', 'core_course_get_contents',
+  'mod_assign_get_assignments', 'mod_assign_get_submission_status',
 ]);
 
 export class MoodleError extends Error {}
