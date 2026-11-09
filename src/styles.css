@@ -32,6 +32,8 @@ main { max-width: 1168px; margin: 0 auto; padding: 0 0 32px; }
 .eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .06em; color: #60766a; margin: 0 0 8px; }
 h1 { font-size: clamp(25px, 3.3vw, 34px); letter-spacing: .01em; line-height: 1.5; margin: 0 0 8px; font-weight: 700; }
 .intro-description { color: var(--muted); font-size: 13px; line-height: 1.9; margin: 0; }
+.usage-note { color: #52675d; font-size: 12px; line-height: 1.85; margin: 12px 0 0; max-width: 850px; }
+.usage-note a { white-space: nowrap; text-underline-offset: 3px; }
 .workspace { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 26px; align-items: start; }
 .dashboard-column { display: grid; gap: 18px; min-width: 0; }
 .card { background: #fff; border: 1px solid var(--border); border-radius: 13px; box-shadow: 0 2px 6px #183e2603; }

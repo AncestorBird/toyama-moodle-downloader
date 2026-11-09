@@ -25,6 +25,7 @@
         <p class="eyebrow">富山大学 · 専門科目 / その他</p>
         <h1>授業ごとの課題と資料</h1>
         <p class="intro-description">課題は自動で確認。資料を保存するときは、画面を切り替えます。</p>
+        <p class="usage-note">富山大学の非公式ツールです。自分のアカウントで、閲覧権限のある資料を学習目的で利用し、資料を無断で再配布・公開しないでください。<a href="#usage-notes">利用上の注意を読む</a></p>
       </section>
 
       <div class="workspace">
@@ -109,7 +110,7 @@
                 <option value="unknown">確認できなかった課題</option>
               </select></label>
             </div>
-            <p class="assignment-note">Moodle上の状態です。紙で提出済みの場合は、授業の指示も確認してください。締切は日本時間です。</p>
+            <p class="assignment-note">締切・提出状況は補助情報です。最終確認はMoodle本体や授業の指示で行ってください。紙で提出済みの場合も授業の指示を確認してください。締切は日本時間です。</p>
             <div id="assignment-warnings" class="assignment-warnings"></div>
             <div id="assignment-list" class="assignment-list"><div class="empty-state"><h3>ログインして課題を確認</h3><p>授業を一つずつ選ばずに、対象の範囲をまとめて確認できます。</p></div></div>
           </section>
@@ -135,13 +136,17 @@
       </div>
 
       <footer>
-        <p>富山大学の公式ツールではありません。</p>
-        <details><summary>情報の扱い・対応範囲</summary><div class="privacy-details">
+        <p><a href="https://github.com/AncestorBird/toyama-moodle-downloader/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a> · <a href="./third-party-notices.txt" target="_blank" rel="noopener noreferrer">第三者ライセンス表記</a></p>
+        <details><summary>利用上の注意・情報の扱い</summary><div id="usage-notes" class="privacy-details">
+          <p>富山大学の非公式ツールであり、大学による承認・推奨を示すものではありません。自分のアカウントを使い、閲覧権限のある資料を本人の学習目的で取得してください。</p>
+          <p>取得資料には著作権や授業ごとの利用条件があります。権利者の許可なく再配布・一般公開しないでください。大学や授業の利用ルールに従い、大量の連続取得や必要以上の再確認など、サーバーに負荷をかける使い方を控えてください。</p>
+          <p>パスワード、APIトークン、授業資料、個人情報をIssueや公開ログへ貼らないでください。</p>
           <p>GitHub Pagesで動く静的なWebアプリです。認証情報・トークン・資料をアプリのサーバーへ送信せず、Moodleに直接接続します。外部のアクセス解析は使用しません。</p>
           <p>アプリはパスワード・トークンをlocalStorageやCookieに保存しません。ブラウザのパスワード保存・同期は、ご自身のブラウザ設定で管理してください。保存された項目の削除もパスワードマネージャーで行えます。</p>
           <p>ログアウト・ページ再読み込みで、この画面の認証トークンは破棄されます。大学側のトークンを失効させる操作は行いません。発行されるAPIトークン自体が読み取り専用とは限りません。</p>
           <p>授業内容APIに掲載されたMoodle内のファイルが対象です。外部サイト・ストリーミング動画・追加認証には対応しません。Web版は毎回新しいZIPを作成し、取得済みファイルとの差分判定はしません。大容量資料や差分取得にはGitHubのCLI版を利用できます。</p>
-          <p>課題確認は、対象の年度・クォーター・検索条件に合う授業のMoodle課題と提出状態を自動で読み取ります。小テスト・紙提出・非公開や閲覧権限のない課題は対象外です。課題を提出・変更する操作は行いません。取得した提出状態はログアウト・再読み込みで消去されます。</p>
+          <p>課題確認は、対象の年度・クォーター・検索条件に合う授業のMoodle課題と提出状態を自動で読み取ります。締切・提出状況は補助情報として扱い、最終確認はMoodle本体や授業の指示で行ってください。小テスト・紙提出・非公開や閲覧権限のない課題は対象外です。課題を提出・変更する操作は行いません。取得した提出状態はログアウト・再読み込みで消去されます。</p>
+          <p>本ツールの自作コードはMIT Licenseです。大学の教材・取得資料・第三者の依存ライブラリの権利や利用条件を変更するものではありません。</p>
           <p>このページの配信元としてGitHub Pagesにも通常のアクセス情報が送られます。ブラウザの拡張機能やパスワード同期機能は、それぞれの設定に従います。</p>
         </div></details>
       </footer>
